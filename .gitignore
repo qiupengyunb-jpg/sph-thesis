@@ -1052,3 +1052,8 @@ build_wasm_debug
 # CodeQL
 _codeql_detected_source_root
 build_test/
+
+##### Project local build directories
+# Local MSVC 145 (Visual Studio 2026) out-of-source build tree used for the
+# axisymmetric fibre-film user examples. Regenerable, never committed.
+build_msvc145_current/
