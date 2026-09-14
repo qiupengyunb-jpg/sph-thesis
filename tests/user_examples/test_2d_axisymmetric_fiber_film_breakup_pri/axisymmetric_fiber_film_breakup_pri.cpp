@@ -2274,6 +2274,21 @@ class PressureForceDiagnostic : public LocalDynamics,
     StdVec<Real *> wall_volume_;
 };
 
+/** Identify contact bodies that may only complete the kernel support.
+ *
+ * The half-axisymmetric model mirrors the meridional plane about r=0 and
+ * fills the r<0 side with a numerical symmetry body.  Those particles must
+ * contribute to the Shepard sum and to the colour gradient, otherwise the
+ * liquid support near the axis is incomplete and the reconstructed interface
+ * normal degenerates there.  They must not, however, act as a wettable solid:
+ * the axis is a free-slip mirror plane, so it carries no contact angle, no
+ * Young traction and no adhesion.
+ */
+bool IsSupportOnlyContactBody(SPHBody *body)
+{
+    return body->Name() == "AxisSymmetryBoundary";
+}
+
 /**
  * One-sided continuum-surface-stress (CSS) model with an axisymmetric stress
  * divergence correction.  The liquid support deficiency supplies the local
@@ -2319,6 +2334,9 @@ class LocalAxisymmetricSurfaceStress : public ForcePrior,
         for (BaseParticles *fibre_particles : contact_particles_)
             fibre_Vol_.push_back(
                 fibre_particles->getVariableDataByName<Real>("VolumetricMeasure"));
+        for (SPHBody *contact_body : contact_bodies_)
+            contact_body_is_wettable_.push_back(
+                !IsSupportOnlyContactBody(contact_body));
         particles_->registerSingleVariable<Real>("SurfaceTensionCoef", breakup_options.gamma_lg);
         particles_->registerSingleVariable<Real>(
             "ExternalDynamicContactCosine",
@@ -3324,6 +3342,10 @@ class LocalAxisymmetricSurfaceStress : public ForcePrior,
                     Vecd neighbour_direction = Vecd::Zero();
                     for (size_t k = 0; k < contact_configuration_.size(); ++k)
                     {
+                        // Support-only bodies (the axis symmetry plane) never
+                        // act as an adhesive wall.
+                        if (!contact_body_is_wettable_[k])
+                            continue;
                         Real *fibre_volume = fibre_Vol_[k];
                         const Neighborhood &fibre_neighborhood =
                             (*contact_configuration_[k])[i];
@@ -3395,6 +3417,7 @@ class LocalAxisymmetricSurfaceStress : public ForcePrior,
         *dynamic_contact_cosine_;
     int *indicator_, *contact_line_, *support_neighbors_, *pca_normal_used_;
     StdVec<Real *> fibre_Vol_;
+    StdVec<bool> contact_body_is_wettable_;
     Real *contact_angle_weight_, *surface_confidence_;
     Matd *stress_, *correction_matrix_;
 };
@@ -3464,6 +3487,9 @@ class JfmAxisymmetricFiberWettingForce : public ForcePrior,
         for (BaseParticles *fibre_particles : contact_particles_)
             fibre_Vol_.push_back(
                 fibre_particles->getVariableDataByName<Real>("VolumetricMeasure"));
+        for (SPHBody *contact_body : contact_bodies_)
+            contact_body_is_wettable_.push_back(
+                !IsSupportOnlyContactBody(contact_body));
 
         particles_->addEvolvingVariable<Real>("JfmShepardSum");
         particles_->addEvolvingVariable<Vecd>("JfmRawNormal");
@@ -3584,6 +3610,11 @@ class JfmAxisymmetricFiberWettingForce : public ForcePrior,
             }
             if (include_solid_normal_support)
             {
+                // Every contact body contributes here, including the support
+                // only symmetry plane.  Near a fully coated fibre tip the film
+                // wraps onto the axis, and without the mirrored half of the
+                // support the colour gradient collapses onto the radial
+                // coordinate and the reconstructed normal degenerates.
                 for (size_t k = 0; k < contact_configuration_.size(); ++k)
                 {
                     Real *fibre_volume = fibre_Vol_[k];
@@ -3651,6 +3682,11 @@ class JfmAxisymmetricFiberWettingForce : public ForcePrior,
                                         static_cast<Real>(footprint_bins))));
         };
         bool has_resolved_footprint = HasCentralWetFootprint();
+        // A three-phase contact line needs a wall patch that is exposed to
+        // gas.  When the film seals the whole fibre no such patch exists, so
+        // the closed end caps must never be reported as contact lines however
+        // close their first liquid layer happens to sit to the solid.
+        bool wall_exposes_gas = HasCentralWetFootprint();
         if (has_resolved_footprint)
         {
             std::fill(dominant_footprint_bins.begin(),
@@ -3705,6 +3741,7 @@ class JfmAxisymmetricFiberWettingForce : public ForcePrior,
                                         closed_wet.end(), 0);
             if (dry_anchor != closed_wet.end())
             {
+                wall_exposes_gas = true;
                 size_t anchor = static_cast<size_t>(
                     dry_anchor - closed_wet.begin());
                 size_t dry_run = 0, maximum_dry_run = 0;
@@ -3936,8 +3973,16 @@ class JfmAxisymmetricFiberWettingForce : public ForcePrior,
                 fibre_tangent /= fibre_tangent.norm();
             size_t contact_side =
                 pos_[i][0] < 0.5 * (footprint_left + footprint_right) ? 0 : 1;
-            contact_line_[i] = 1;
-            contact_line_speed_[i] = contact_outward_speed[contact_side];
+            // A sealed film has no liquid-gas-solid triple junction, so the
+            // near-wall band at its closed caps must not be reported as a
+            // contact line.  The blended normal below is still applied: close
+            // to the axis the colour-gradient normal loses the mirrored
+            // support and this wall-consistent value is the reliable one.
+            if (wall_exposes_gas)
+            {
+                contact_line_[i] = 1;
+                contact_line_speed_[i] = contact_outward_speed[contact_side];
+            }
             if (apply_contact_angle_correction_)
             {
                 Real local_target_angle =
@@ -4026,6 +4071,11 @@ class JfmAxisymmetricFiberWettingForce : public ForcePrior,
                     fibre_normal * std::cos(local_target_angle);
                 for (size_t k = 0; k < contact_configuration_.size(); ++k)
                 {
+                    // Virtual wall normals and the contact-angle extension only
+                    // make sense for a physical wettable solid.  The axis
+                    // symmetry plane completes the support but is not a wall.
+                    if (!contact_body_is_wettable_[k])
+                        continue;
                     Real *fibre_volume = fibre_Vol_[k];
                     const Neighborhood &fibre_neighborhood =
                         (*contact_configuration_[k])[i];
@@ -4328,6 +4378,10 @@ class JfmAxisymmetricFiberWettingForce : public ForcePrior,
                     Vecd neighbour_direction = Vecd::Zero();
                     for (size_t k = 0; k < contact_configuration_.size(); ++k)
                     {
+                        // Adhesion is a solid-wall interaction, so the axis
+                        // symmetry plane must stay out of it.
+                        if (!contact_body_is_wettable_[k])
+                            continue;
                         Real *fibre_volume = fibre_Vol_[k];
                         const Neighborhood &fibre_neighborhood =
                             (*contact_configuration_[k])[i];
@@ -4395,6 +4449,7 @@ class JfmAxisymmetricFiberWettingForce : public ForcePrior,
         *pca_normal_used_;
     Real *physical_time_;
     StdVec<Real *> fibre_Vol_;
+    StdVec<bool> contact_body_is_wettable_;
     StdVec<Vecd> normal_buffer_a_, normal_buffer_b_, liquid_normal_buffer_;
     StdVec<Real> curvature_shepard_buffer_, force_weight_buffer_;
     Real W0_, smoothing_length_, kernel_radius_;
@@ -7076,8 +7131,13 @@ int SPHINXSYS_BREAKUP_ENTRY_POINT(int argc, char *argv[])
         regularize_bulk_particles(
             DynamicsArgs(liquid_inner, breakup_options.regularization_coefficient),
             liquid_fibre_contact);
+    // The capillary model receives the combined wall relation so that the
+    // symmetry-plane particles complete its kernel support: without them the
+    // reconstructed free-surface normal degenerates where the film wraps
+    // around a fibre tip.  Those particles are support only, and the
+    // wettability mask inside the force classes keeps the axis free-slip.
     SelectableAxisymmetricCapillaryForce local_capillary_force(
-        liquid_inner, liquid_fibre_contact,
+        liquid_inner, liquid_wall_contact,
         sph_system.svPhysicalTime().Data());
     XuVanDerWaalsForce van_der_waals_force(liquid_inner);
     InteractionWithUpdate<TangentialSurfaceRegularization>
