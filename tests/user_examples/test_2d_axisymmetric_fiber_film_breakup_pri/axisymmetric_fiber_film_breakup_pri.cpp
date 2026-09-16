@@ -136,6 +136,13 @@ struct BreakupOptions
     Real support_gate_budget_in_dx = 0.5;     // cumulative per-particle cap
     int support_gate_min_neighbours = 2;      // neighbours also above the gate
     Real support_gate_min_layers = 4.0;       // local film thickness in dx
+    // Late-window directional variant (2026-09-16): the gate is the angular-gap
+    // increase plus the gap dominance ratio, and the direction is the bisector
+    // of the largest angular gap.  The delta deficit is kept as a watch-only
+    // diagnostic and no longer drives anything.
+    Real support_gate_gap_increase = 0.010;   // Delta G in radians
+    Real support_gate_gap_ratio = 1.5;        // G1 / G2
+    Real support_gate_wall_clearance_in_dx = 3.0;  // T=0 depth above the wall
     std::string normal_reconstruction = "gradient";
     std::string jfm_solid_extension = "hydrophilic-only";
     std::string jfm_neighbor_mode = "mixed-support";
@@ -397,6 +404,15 @@ BreakupOptions ParseBreakupOptions(int argc, char *argv[],
         else if (StartsWith(argument, "--support-gate-min-layers="))
             options.support_gate_min_layers = std::stod(argument.substr(
                 std::string("--support-gate-min-layers=").size()));
+        else if (StartsWith(argument, "--support-gate-gap-increase="))
+            options.support_gate_gap_increase = std::stod(argument.substr(
+                std::string("--support-gate-gap-increase=").size()));
+        else if (StartsWith(argument, "--support-gate-gap-ratio="))
+            options.support_gate_gap_ratio = std::stod(argument.substr(
+                std::string("--support-gate-gap-ratio=").size()));
+        else if (StartsWith(argument, "--support-gate-wall-clearance-dx="))
+            options.support_gate_wall_clearance_in_dx = std::stod(argument.substr(
+                std::string("--support-gate-wall-clearance-dx=").size()));
         else if (StartsWith(argument, "--normal-reconstruction="))
             options.normal_reconstruction = argument.substr(24);
         else if (StartsWith(argument, "--jfm-solid-extension="))
@@ -752,6 +768,17 @@ BreakupOptions ParseBreakupOptions(int argc, char *argv[],
     if (options.support_gate_min_layers < 0.0 ||
         options.support_gate_min_layers > 16.0)
         throw std::runtime_error("--support-gate-min-layers must be in [0,16].");
+    if (options.support_gate_gap_increase <= 0.0 ||
+        options.support_gate_gap_increase > 1.0)
+        throw std::runtime_error(
+            "--support-gate-gap-increase must be in (0,1] radians.");
+    if (options.support_gate_gap_ratio < 1.0 ||
+        options.support_gate_gap_ratio > 10.0)
+        throw std::runtime_error("--support-gate-gap-ratio must be in [1,10].");
+    if (options.support_gate_wall_clearance_in_dx < 0.0 ||
+        options.support_gate_wall_clearance_in_dx > 16.0)
+        throw std::runtime_error(
+            "--support-gate-wall-clearance-dx must be in [0,16].");
     if (options.normal_reconstruction != "gradient" &&
         options.normal_reconstruction != "pca")
         throw std::runtime_error("--normal-reconstruction must be gradient or pca.");
@@ -5378,10 +5405,13 @@ class SupportGateReferenceCapture : public LocalDynamics, public DataDelegateInn
         : LocalDynamics(inner_relation.getSPHBody()),
           DataDelegateInner(inner_relation),
           W0_(inner_relation.getSPHBody().getSPHAdaptation().getKernel()->W0(ZeroVecd)),
+          pos_(particles_->getVariableDataByName<Vecd>("Position")),
           indicator_(particles_->getVariableDataByName<int>("Indicator")),
-          s_ref_(particles_->registerStateVariableData<Real>("SupportSumReference")),
+          gap_ref_(particles_->registerStateVariableData<Real>("SupportGapReference")),
+          sum_ref_(particles_->registerStateVariableData<Real>("SupportSumReference")),
           eligible_(particles_->registerStateVariableData<int>("SupportGateEligible"))
     {
+        particles_->addEvolvingVariable<Real>("SupportGapReference");
         particles_->addEvolvingVariable<Real>("SupportSumReference");
         particles_->addEvolvingVariable<int>("SupportGateEligible");
         particles_->addVariableToWrite<int>("SupportGateEligible");
@@ -5389,63 +5419,160 @@ class SupportGateReferenceCapture : public LocalDynamics, public DataDelegateInn
 
     void update(size_t index_i, Real dt = 0.0)
     {
-        Real sigma = W0_;
+        // Largest angular gap at T=0 (same definition as the offline probe).
+        // SimpleDynamics calls update(), so this runs once before the loop.
+        Real angles[64];
+        size_t m = 0;
         const Neighborhood &neighborhood = inner_configuration_[index_i];
         for (size_t n = 0; n != neighborhood.current_size_; ++n)
-            sigma += neighborhood.W_ij_[n];
-        s_ref_[index_i] = sigma;
-        // The gate may only act on particles that were interior at T=0; the
-        // current Indicator is itself triggered by support loss, so it cannot
-        // be used for the cohort definition.
-        eligible_[index_i] = (indicator_[index_i] == 0) ? 1 : 0;
+        {
+            const size_t index_j = neighborhood.j_[n];
+            if (index_j == index_i || m >= 64)
+                continue;
+            Vecd d = pos_[index_j] - pos_[index_i];
+            if (d.norm() < TinyReal)
+                continue;
+            angles[m++] = std::atan2(d[1], d[0]);
+        }
+        Real g1 = 0.0;
+        if (m >= 3)
+        {
+            std::sort(angles, angles + m);
+            for (size_t k = 0; k != m; ++k)
+            {
+                Real a0 = angles[k];
+                Real a1 = (k + 1 < m) ? angles[k + 1] : angles[0] + 2.0 * Pi;
+                g1 = std::max(g1, a1 - a0);
+            }
+        }
+        gap_ref_[index_i] = g1;
+        // also keep the T=0 kernel sum, used only by the watch-only delta
+        Real sigma_ref = W0_;
+        for (size_t n = 0; n != neighborhood.current_size_; ++n)
+            sigma_ref += neighborhood.W_ij_[n];
+        sum_ref_[index_i] = sigma_ref;
+        // Cohort: interior at T=0 (the current Indicator is itself triggered by
+        // support loss, so it must not be used) and far enough from the fibre
+        // wall, where a one-sided neighbourhood is perfectly normal.
+        Real depth = pos_[index_i][1] - FiberRadius(pos_[index_i][0]);
+        eligible_[index_i] = (indicator_[index_i] == 0 &&
+                              depth >= breakup_options.support_gate_wall_clearance_in_dx *
+                                           ParticleSpacing())
+                                 ? 1
+                                 : 0;
     }
 
   private:
     Real W0_;
+    Vecd *pos_;
     int *indicator_, *eligible_;
-    Real *s_ref_;
+    Real *gap_ref_, *sum_ref_;
 };
 
-class SupportGateDeficitProbe : public LocalDynamics, public DataDelegateInner
+/* Angular-gap probe.  One neighbour sweep yields, for every particle:
+ *   SupportGapMax / SupportGapSecond   largest and second largest angular gap
+ *   SupportGapIncrease                 G1(T) - G1(0)      <- the gate
+ *   SupportGapBisector                 unit bisector of the largest gap, i.e.
+ *                                      the direction of the missing support
+ *   SupportDeficit                     the old delta, now WATCH ONLY
+ * The bisector direction was calibrated offline (dir_credibility_20260916):
+ * when Delta G > 0.010 rad and G1/G2 > 1.5 it agrees with the offline
+ * missing-support direction at cos = 0.96-0.98 with 96-100% above 0.7, and it
+ * never fires on the healthy film.  Below T ~ 40 the deficit is diffuse
+ * (G1/G2 <= 1.18) and the same criterion selects nothing, which is the
+ * intended behaviour of a late-window gate. */
+class SupportGapProbe : public LocalDynamics, public DataDelegateInner
 {
   public:
-    explicit SupportGateDeficitProbe(BaseInnerRelation &inner_relation)
+    explicit SupportGapProbe(BaseInnerRelation &inner_relation)
         : LocalDynamics(inner_relation.getSPHBody()),
           DataDelegateInner(inner_relation),
           W0_(inner_relation.getSPHBody().getSPHAdaptation().getKernel()->W0(ZeroVecd)),
+          gap_ref_(particles_->getVariableDataByName<Real>("SupportGapReference")),
           s_ref_(particles_->getVariableDataByName<Real>("SupportSumReference")),
+          pos_(particles_->getVariableDataByName<Vecd>("Position")),
           s_now_(particles_->registerStateVariableData<Real>("SupportSumCurrent")),
+          g1_(particles_->registerStateVariableData<Real>("SupportGapMax")),
+          g2_(particles_->registerStateVariableData<Real>("SupportGapSecond")),
+          dg_(particles_->registerStateVariableData<Real>("SupportGapIncrease")),
+          bis_(particles_->registerStateVariableData<Vecd>("SupportGapBisector")),
           deficit_(particles_->registerStateVariableData<Real>("SupportDeficit")),
           watch_(particles_->registerStateVariableData<int>("SupportGateWatch"))
     {
+        particles_->addEvolvingVariable<Real>("SupportGapMax");
         particles_->addEvolvingVariable<Real>("SupportSumCurrent");
+        particles_->addEvolvingVariable<Real>("SupportGapSecond");
+        particles_->addEvolvingVariable<Real>("SupportGapIncrease");
+        particles_->addEvolvingVariable<Vecd>("SupportGapBisector");
         particles_->addEvolvingVariable<Real>("SupportDeficit");
         particles_->addEvolvingVariable<int>("SupportGateWatch");
+        particles_->addVariableToWrite<Real>("SupportGapIncrease");
+        particles_->addVariableToWrite<Vecd>("SupportGapBisector");
         particles_->addVariableToWrite<Real>("SupportDeficit");
         particles_->addVariableToWrite<int>("SupportGateWatch");
     }
 
     void interaction(size_t index_i, Real dt = 0.0)
     {
+        Real angles[64];
+        size_t m = 0;
         Real sigma = W0_;
         const Neighborhood &neighborhood = inner_configuration_[index_i];
         for (size_t n = 0; n != neighborhood.current_size_; ++n)
+        {
+            const size_t index_j = neighborhood.j_[n];
             sigma += neighborhood.W_ij_[n];
+            if (index_j == index_i || m >= 64)
+                continue;
+            Vecd d = pos_[index_j] - pos_[index_i];
+            if (d.norm() < TinyReal)
+                continue;
+            angles[m++] = std::atan2(d[1], d[0]);
+        }
+        Real g1 = 0.0, g2 = 0.0, bisector = 0.0;
+        if (m >= 3)
+        {
+            std::sort(angles, angles + m);
+            for (size_t k = 0; k != m; ++k)
+            {
+                Real a0 = angles[k];
+                Real a1 = (k + 1 < m) ? angles[k + 1] : angles[0] + 2.0 * Pi;
+                Real gap = a1 - a0;
+                if (gap > g1)
+                {
+                    g2 = g1;
+                    g1 = gap;
+                    bisector = a0 + 0.5 * gap;
+                }
+                else if (gap > g2)
+                {
+                    g2 = gap;
+                }
+            }
+        }
+        g1_[index_i] = g1;
+        g2_[index_i] = g2;
+        dg_[index_i] = g1 - gap_ref_[index_i];
+        bis_[index_i] = Vecd(std::cos(bisector), std::sin(bisector));
         s_now_[index_i] = sigma;
     }
 
     void update(size_t index_i, Real dt = 0.0)
     {
+        // The delta deficit is WATCH ONLY in this variant.
         Real reference = s_ref_[index_i];
-        Real delta = reference > TinyReal ? 1.0 - s_now_[index_i] / reference : 0.0;
-        deficit_[index_i] = delta;
-        // delta = 0.03 level is recorded only; it never drives the correction.
-        watch_[index_i] = delta > breakup_options.support_gate_watch_deficit ? 1 : 0;
+        deficit_[index_i] = reference > TinyReal
+                                ? 1.0 - s_now_[index_i] / reference
+                                : 0.0;
+        watch_[index_i] =
+            deficit_[index_i] > breakup_options.support_gate_watch_deficit ? 1 : 0;
     }
 
   private:
     Real W0_;
-    Real *s_ref_, *s_now_, *deficit_;
+    Vecd *pos_;
+    Real *gap_ref_, *s_ref_, *s_now_, *g1_, *g2_, *dg_, *deficit_;
+    Vecd *bis_;
     int *watch_;
 };
 
@@ -5532,7 +5659,10 @@ class GatedSupportRestoration : public LocalDynamics, public DataDelegateInner
         : LocalDynamics(inner_relation.getSPHBody()),
           DataDelegateInner(inner_relation),
           pos_(particles_->getVariableDataByName<Vecd>("Position")),
-          deficit_(particles_->getVariableDataByName<Real>("SupportDeficit")),
+          g1_(particles_->getVariableDataByName<Real>("SupportGapMax")),
+          g2_(particles_->getVariableDataByName<Real>("SupportGapSecond")),
+          dg_(particles_->getVariableDataByName<Real>("SupportGapIncrease")),
+          bis_(particles_->getVariableDataByName<Vecd>("SupportGapBisector")),
           layers_(particles_->getVariableDataByName<Real>("SupportFilmLayers")),
           eligible_(particles_->getVariableDataByName<int>("SupportGateEligible")),
           state_(particles_->registerStateVariableData<int>("SupportGateState")),
@@ -5565,34 +5695,20 @@ class GatedSupportRestoration : public LocalDynamics, public DataDelegateInner
             return;
         if (state_[index_i] == 2 || eligible_[index_i] != 1 || dry_)
             return;
-        if (deficit_[index_i] <= breakup_options.support_gate_act_deficit)
+        // Late-window gate: the deficit must have grown AND the largest angular
+        // gap must clearly dominate the second one, which is what makes the
+        // bisector a trustworthy direction (see dir_credibility_20260916).
+        if (dg_[index_i] <= breakup_options.support_gate_gap_increase)
+            return;
+        Real ratio = g2_[index_i] > TinyReal
+                         ? g1_[index_i] / g2_[index_i]
+                         : breakup_options.support_gate_gap_ratio;
+        if (ratio <= breakup_options.support_gate_gap_ratio)
             return;
         if (layers_[index_i] < breakup_options.support_gate_min_layers)
             return;
         const Neighborhood &neighborhood = inner_configuration_[index_i];
         if (neighborhood.current_size_ < 4)
-            return;
-
-        Vecd centroid = Vecd::Zero();
-        Real weight_sum = 0.0;
-        int neighbours_above = 0;
-        for (size_t n = 0; n != neighborhood.current_size_; ++n)
-        {
-            const size_t index_j = neighborhood.j_[n];
-            Real weight = neighborhood.W_ij_[n];
-            centroid += weight * (pos_[index_j] - pos_[index_i]);
-            weight_sum += weight;
-            if (deficit_[index_j] > breakup_options.support_gate_act_deficit)
-                ++neighbours_above;
-        }
-        if (neighbours_above < breakup_options.support_gate_min_neighbours)
-            return;
-        if (weight_sum <= TinyReal)
-            return;
-
-        Vecd d_now = centroid / weight_sum;
-        Real d_norm = d_now.norm();
-        if (d_norm <= TinyReal)
             return;
 
         Real budget = breakup_options.support_gate_budget_in_dx * ParticleSpacing();
@@ -5606,9 +5722,14 @@ class GatedSupportRestoration : public LocalDynamics, public DataDelegateInner
                          dt_per_unit_T_;
         if (magnitude > remaining)
             magnitude = remaining;
-        // Direction is MINUS the neighbour centroid: moving toward the centroid
-        // was measured to point away from the missing support and widen the void.
-        shift_[index_i] = -magnitude * d_now / d_norm;
+        // Direction: the bisector of the largest angular gap, which points into
+        // the empty sector, i.e. toward the missing support.  Neither delta nor
+        // the neighbour centroid is used any more.
+        Vecd dir = bis_[index_i];
+        Real dir_norm = dir.norm();
+        if (dir_norm <= TinyReal)
+            return;
+        shift_[index_i] = magnitude * dir / dir_norm;
         active_[index_i] = 1;
     }
 
@@ -5625,7 +5746,8 @@ class GatedSupportRestoration : public LocalDynamics, public DataDelegateInner
 
   private:
     Vecd *pos_, *shift_;
-    Real *deficit_, *layers_, *dose_;
+    Real *g1_, *g2_, *dg_, *layers_, *dose_;
+    Vecd *bis_;
     int *eligible_, *state_, *active_;
     Real dt_per_unit_T_ = 0.0;
     bool dry_ = false;
@@ -6825,6 +6947,13 @@ void WriteBreakupParameters(const std::string &output_folder)
          << ",neighbours that must also exceed the gate threshold\n";
     file << "support_gate_min_layers," << breakup_options.support_gate_min_layers
          << ",local film thickness floor in particle spacings\n";
+    file << "support_gate_gap_increase," << breakup_options.support_gate_gap_increase
+         << ",Delta G gate in radians (late-window directional variant)\n";
+    file << "support_gate_gap_ratio," << breakup_options.support_gate_gap_ratio
+         << ",G1/G2 direction-credibility gate\n";
+    file << "support_gate_wall_clearance_in_dx,"
+         << breakup_options.support_gate_wall_clearance_in_dx
+         << ",T=0 depth above the fibre wall required for the cohort\n";
     file << "surface_max_shift_dx," << breakup_options.surface_max_shift_in_dx
          << ",maximum tangential position correction per advection step\n";
     file << "surface_hourglass_coefficient," << breakup_options.surface_hourglass_coefficient
@@ -7540,7 +7669,7 @@ int SPHINXSYS_BREAKUP_ENTRY_POINT(int argc, char *argv[])
     // step.  Construction order fixes the state-variable registration order.
     SimpleDynamics<SupportGateReferenceCapture> capture_support_reference(liquid_inner);
     SupportGateFilmThickness support_gate_film_thickness(liquid);
-    InteractionWithUpdate<SupportGateDeficitProbe> support_gate_probe(liquid_inner);
+    InteractionWithUpdate<SupportGapProbe> support_gate_probe(liquid_inner);
     InteractionWithUpdate<GatedSupportRestoration> support_gate(liquid_inner);
 
     Dynamics1Level<fluid_dynamics::Integration1stHalfWithWallRiemann>
