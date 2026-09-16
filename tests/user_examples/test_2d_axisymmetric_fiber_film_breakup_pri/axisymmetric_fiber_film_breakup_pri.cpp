@@ -127,6 +127,15 @@ struct BreakupOptions
     Real surface_regularization_coefficient = 0.05;
     Real surface_max_shift_in_dx = 0.03;
     Real surface_hourglass_coefficient = 4.5;
+    // Gated support restoration (see GatedSupportRestoration below).  Off by
+    // default; the minimal first-round setting uses the values below.
+    bool support_gate = false;
+    Real support_gate_watch_deficit = 0.03;   // recorded only, never acts
+    Real support_gate_act_deficit = 0.05;     // gate threshold that acts
+    Real support_gate_rate_in_dx = 0.01;      // kappa, dx per unit T
+    Real support_gate_budget_in_dx = 0.5;     // cumulative per-particle cap
+    int support_gate_min_neighbours = 2;      // neighbours also above the gate
+    Real support_gate_min_layers = 4.0;       // local film thickness in dx
     std::string normal_reconstruction = "gradient";
     std::string jfm_solid_extension = "hydrophilic-only";
     std::string jfm_neighbor_mode = "mixed-support";
@@ -362,6 +371,32 @@ BreakupOptions ParseBreakupOptions(int argc, char *argv[],
             options.surface_max_shift_in_dx = std::stod(argument.substr(23));
         else if (StartsWith(argument, "--surface-hourglass="))
             options.surface_hourglass_coefficient = std::stod(argument.substr(20));
+        else if (StartsWith(argument, "--support-gate="))
+        {
+            std::string value = argument.substr(
+                std::string("--support-gate=").size());
+            if (value != "on" && value != "off")
+                throw std::runtime_error("--support-gate must be on or off.");
+            options.support_gate = value == "on";
+        }
+        else if (StartsWith(argument, "--support-gate-watch-deficit="))
+            options.support_gate_watch_deficit = std::stod(argument.substr(
+                std::string("--support-gate-watch-deficit=").size()));
+        else if (StartsWith(argument, "--support-gate-act-deficit="))
+            options.support_gate_act_deficit = std::stod(argument.substr(
+                std::string("--support-gate-act-deficit=").size()));
+        else if (StartsWith(argument, "--support-gate-rate-dx-per-T="))
+            options.support_gate_rate_in_dx = std::stod(argument.substr(
+                std::string("--support-gate-rate-dx-per-T=").size()));
+        else if (StartsWith(argument, "--support-gate-budget-dx="))
+            options.support_gate_budget_in_dx = std::stod(argument.substr(
+                std::string("--support-gate-budget-dx=").size()));
+        else if (StartsWith(argument, "--support-gate-min-neighbours="))
+            options.support_gate_min_neighbours = std::stoi(argument.substr(
+                std::string("--support-gate-min-neighbours=").size()));
+        else if (StartsWith(argument, "--support-gate-min-layers="))
+            options.support_gate_min_layers = std::stod(argument.substr(
+                std::string("--support-gate-min-layers=").size()));
         else if (StartsWith(argument, "--normal-reconstruction="))
             options.normal_reconstruction = argument.substr(24);
         else if (StartsWith(argument, "--jfm-solid-extension="))
@@ -695,6 +730,28 @@ BreakupOptions ParseBreakupOptions(int argc, char *argv[],
     if (options.surface_hourglass_coefficient < 0.0 ||
         options.surface_hourglass_coefficient > 6.0)
         throw std::runtime_error("--surface-hourglass must be in [0,6].");
+    if (options.support_gate_watch_deficit <= 0.0 ||
+        options.support_gate_watch_deficit >= options.support_gate_act_deficit)
+        throw std::runtime_error(
+            "--support-gate-watch-deficit must be positive and below "
+            "--support-gate-act-deficit.");
+    if (options.support_gate_act_deficit <= 0.0 ||
+        options.support_gate_act_deficit > 0.5)
+        throw std::runtime_error("--support-gate-act-deficit must be in (0,0.5].");
+    if (options.support_gate_rate_in_dx <= 0.0 ||
+        options.support_gate_rate_in_dx > 0.2)
+        throw std::runtime_error(
+            "--support-gate-rate-dx-per-T must be in (0,0.2]; the physical "
+            "material speed in this case is only 0.1-0.4 dx per unit T.");
+    if (options.support_gate_budget_in_dx <= 0.0 ||
+        options.support_gate_budget_in_dx > 2.0)
+        throw std::runtime_error("--support-gate-budget-dx must be in (0,2].");
+    if (options.support_gate_min_neighbours < 0 ||
+        options.support_gate_min_neighbours > 8)
+        throw std::runtime_error("--support-gate-min-neighbours must be in [0,8].");
+    if (options.support_gate_min_layers < 0.0 ||
+        options.support_gate_min_layers > 16.0)
+        throw std::runtime_error("--support-gate-min-layers must be in [0,16].");
     if (options.normal_reconstruction != "gradient" &&
         options.normal_reconstruction != "pca")
         throw std::runtime_error("--normal-reconstruction must be gradient or pca.");
@@ -5256,6 +5313,324 @@ class TangentialSurfaceRegularization : public LocalDynamics, public DataDelegat
     int *indicator_, *contact_line_;
 };
 
+/* ---------------------------------------------------------------------------
+ * Gated support restoration (minimal first-round implementation).
+ *
+ * STATUS 2026-09-16: STABLE BUT NOT PASSING -- DO NOT USE AS THE MAIN MODEL.
+ * Kept as a documented negative result and a rollback node.  The r=24 T=35
+ * short run (test_2d_axisym_fcf_film_pri, --support-gate=on) was stable and
+ * rate-limited exactly as specified, but it FAILED the acceptance criteria:
+ *   - lesion max delta got WORSE, not better (0.1338 vs 0.1119 at T=34,
+ *     cohort = interior at T=0 and |x0| < 6a);
+ *   - the shift actually applied was nearly orthogonal to the missing-support
+ *     direction (cos = -0.17 .. +0.16 over the whole-domain active set), not
+ *     the +0.36 .. +0.67 measured for the lesion cohort offline;
+ *   - the baseline PR take-off at T=34 (max_speed 0.00905 -> 0.03209) was
+ *     delayed (still 0.00983 at T=35).
+ * Root cause: delta is defined against the perfect T=0 lattice, so it is
+ * sensitive to positional disorder as such; any position correction adds
+ * disorder and therefore raises delta.  The correction fed the very quantity
+ * that gated it.  See gate_T35_20260915/REPORT.md.
+ * Default is off; see --support-gate.  The frozen parameter set of the
+ * negative result was: watch 0.03, act 0.05, kappa 0.01 dx/T, budget 0.5 dx,
+ * >=2 neighbours above threshold, film thickness floor 4 dx.
+ *
+ * Motivation.  At r=16/24/32 the continuous film develops a NON-PHYSICAL
+ * internal radial separation: interior particles lose kernel support long
+ * before the film becomes geometrically thin.  Measured on the r=24 baseline,
+ * the lesion film thickness GROWS from 1.00a to 1.66a while the radial gap
+ * inside it reaches 5.7-12 particle spacings, and the minimum film thickness
+ * over the studied section never drops below 0.96a (23-24 layers).
+ *
+ * Gate variable.  The self-referenced kernel-completeness deficit
+ *     delta_i(T) = 1 - S_i(T) / S_i(0),
+ * with S the self-inclusive, liquid-only kernel sum (WendlandC2, h = 1.3 dx),
+ * separates this from healthy PR growth: the healthy equal-radius control
+ * stays below 0.0023 up to T=84 even though its interface amplitude grows to
+ * A/A0 = 1.49, while the lesion crosses 0.05 before the gap opens.
+ *
+ * Direction.  An offline probe on the existing r=24/r=32 frames
+ * (pr_fibre_diagnostics/gate_precheck.py) measured, against the objective
+ * "missing support" direction,
+ *     cos(+d_now, missing) = -0.29 .. -0.67      (13-35% aligned)
+ *     cos(-d_now, missing) = +0.29 .. +0.67      (66-87% aligned)
+ * where d_now is the kernel-weighted centroid of the CURRENT neighbours.
+ * Moving TOWARD the centroid therefore widens the void, so the correction
+ * uses -d_now, i.e. the standard particle-shifting direction (down the local
+ * number-density gradient).
+ *
+ * Strength.  Delta x = kappa * Dt with kappa = 0.01 dx per unit T, applied on
+ * every advective step.  This is 2.5-9% of the measured material speed of the
+ * activated particles (0.11-0.40 dx per unit T).  A per-step displacement is
+ * only meaningful as a rate: this configuration takes about 2300 advective
+ * steps per unit T, so "c dx per step" would be amplified by that factor -
+ * exactly the magnitude trap that made the transport-velocity correction
+ * diverge at T=1.
+ *
+ * The correction moves positions only.  Velocity, density, pressure, the
+ * capillary/wetting models and every other physical term are untouched.
+ * ------------------------------------------------------------------------- */
+
+class SupportGateReferenceCapture : public LocalDynamics, public DataDelegateInner
+{
+  public:
+    explicit SupportGateReferenceCapture(BaseInnerRelation &inner_relation)
+        : LocalDynamics(inner_relation.getSPHBody()),
+          DataDelegateInner(inner_relation),
+          W0_(inner_relation.getSPHBody().getSPHAdaptation().getKernel()->W0(ZeroVecd)),
+          indicator_(particles_->getVariableDataByName<int>("Indicator")),
+          s_ref_(particles_->registerStateVariableData<Real>("SupportSumReference")),
+          eligible_(particles_->registerStateVariableData<int>("SupportGateEligible"))
+    {
+        particles_->addEvolvingVariable<Real>("SupportSumReference");
+        particles_->addEvolvingVariable<int>("SupportGateEligible");
+        particles_->addVariableToWrite<int>("SupportGateEligible");
+    }
+
+    void update(size_t index_i, Real dt = 0.0)
+    {
+        Real sigma = W0_;
+        const Neighborhood &neighborhood = inner_configuration_[index_i];
+        for (size_t n = 0; n != neighborhood.current_size_; ++n)
+            sigma += neighborhood.W_ij_[n];
+        s_ref_[index_i] = sigma;
+        // The gate may only act on particles that were interior at T=0; the
+        // current Indicator is itself triggered by support loss, so it cannot
+        // be used for the cohort definition.
+        eligible_[index_i] = (indicator_[index_i] == 0) ? 1 : 0;
+    }
+
+  private:
+    Real W0_;
+    int *indicator_, *eligible_;
+    Real *s_ref_;
+};
+
+class SupportGateDeficitProbe : public LocalDynamics, public DataDelegateInner
+{
+  public:
+    explicit SupportGateDeficitProbe(BaseInnerRelation &inner_relation)
+        : LocalDynamics(inner_relation.getSPHBody()),
+          DataDelegateInner(inner_relation),
+          W0_(inner_relation.getSPHBody().getSPHAdaptation().getKernel()->W0(ZeroVecd)),
+          s_ref_(particles_->getVariableDataByName<Real>("SupportSumReference")),
+          s_now_(particles_->registerStateVariableData<Real>("SupportSumCurrent")),
+          deficit_(particles_->registerStateVariableData<Real>("SupportDeficit")),
+          watch_(particles_->registerStateVariableData<int>("SupportGateWatch"))
+    {
+        particles_->addEvolvingVariable<Real>("SupportSumCurrent");
+        particles_->addEvolvingVariable<Real>("SupportDeficit");
+        particles_->addEvolvingVariable<int>("SupportGateWatch");
+        particles_->addVariableToWrite<Real>("SupportDeficit");
+        particles_->addVariableToWrite<int>("SupportGateWatch");
+    }
+
+    void interaction(size_t index_i, Real dt = 0.0)
+    {
+        Real sigma = W0_;
+        const Neighborhood &neighborhood = inner_configuration_[index_i];
+        for (size_t n = 0; n != neighborhood.current_size_; ++n)
+            sigma += neighborhood.W_ij_[n];
+        s_now_[index_i] = sigma;
+    }
+
+    void update(size_t index_i, Real dt = 0.0)
+    {
+        Real reference = s_ref_[index_i];
+        Real delta = reference > TinyReal ? 1.0 - s_now_[index_i] / reference : 0.0;
+        deficit_[index_i] = delta;
+        // delta = 0.03 level is recorded only; it never drives the correction.
+        watch_[index_i] = delta > breakup_options.support_gate_watch_deficit ? 1 : 0;
+    }
+
+  private:
+    Real W0_;
+    Real *s_ref_, *s_now_, *deficit_;
+    int *watch_;
+};
+
+/* Local film thickness per axial bin, in units of dx.  Serial and O(N), which
+ * is negligible next to the neighbour loops.  Returns true when any studied
+ * bin has no liquid particle at all (the "dry_fraction = 0" gate). */
+class SupportGateFilmThickness
+{
+  public:
+    explicit SupportGateFilmThickness(SPHBody &sph_body)
+        : particles_(&sph_body.getBaseParticles()),
+          pos_(particles_->getVariableDataByName<Vecd>("Position")),
+          layers_(particles_->registerStateVariableData<Real>("SupportFilmLayers"))
+    {
+        particles_->addEvolvingVariable<Real>("SupportFilmLayers");
+        particles_->addVariableToWrite<Real>("SupportFilmLayers");
+        Real half_width = 28.0 * fibre_radius;
+        n_bins_ = 28;
+        bin_width_ = 2.0 * fibre_radius;
+        x_lower_ = -half_width;
+        // NOTE: the upper bound must be the end of the LAST bin (half_width),
+        // not half_width - bin_width.  Getting this wrong leaves the last bin
+        // empty, which makes the dry test always true and silently disables the
+        // whole gate (observed in the first r24_gate_T35 attempt).
+        x_upper_ = half_width - TinyReal;
+        max_r_.assign(n_bins_, 0.0);
+        bin_layers_.assign(n_bins_, 0.0);
+    }
+
+    bool update_bins()
+    {
+        std::fill(max_r_.begin(), max_r_.end(), 0.0);
+        const size_t total = particles_->TotalRealParticles();
+        for (size_t i = 0; i != total; ++i)
+        {
+            Real x = pos_[i][0];
+            if (x < x_lower_ || x > x_upper_)
+                continue;
+            size_t b = bin_index(x);
+            if (pos_[i][1] > max_r_[b])
+                max_r_[b] = pos_[i][1];
+        }
+        bool dry = false;
+        for (size_t b = 0; b != n_bins_; ++b)
+        {
+            if (max_r_[b] <= 0.0)
+            {
+                dry = true;
+                bin_layers_[b] = 0.0;
+                continue;
+            }
+            Real xc = x_lower_ + (static_cast<Real>(b) + 0.5) * bin_width_;
+            bin_layers_[b] = (max_r_[b] - FiberRadius(xc)) / ParticleSpacing();
+        }
+        for (size_t i = 0; i != total; ++i)
+        {
+            Real x = pos_[i][0];
+            layers_[i] = (x < x_lower_ || x > x_upper_)
+                             ? 0.0
+                             : bin_layers_[bin_index(x)];
+        }
+        return dry;
+    }
+
+  private:
+    size_t bin_index(Real x) const
+    {
+        size_t b = static_cast<size_t>((x - x_lower_) / bin_width_);
+        return b < n_bins_ ? b : n_bins_ - 1;
+    }
+
+    BaseParticles *particles_;
+    Vecd *pos_;
+    Real *layers_;
+    size_t n_bins_;
+    Real x_lower_, x_upper_, bin_width_;
+    StdVec<Real> max_r_, bin_layers_;
+};
+
+class GatedSupportRestoration : public LocalDynamics, public DataDelegateInner
+{
+  public:
+    explicit GatedSupportRestoration(BaseInnerRelation &inner_relation)
+        : LocalDynamics(inner_relation.getSPHBody()),
+          DataDelegateInner(inner_relation),
+          pos_(particles_->getVariableDataByName<Vecd>("Position")),
+          deficit_(particles_->getVariableDataByName<Real>("SupportDeficit")),
+          layers_(particles_->getVariableDataByName<Real>("SupportFilmLayers")),
+          eligible_(particles_->getVariableDataByName<int>("SupportGateEligible")),
+          state_(particles_->registerStateVariableData<int>("SupportGateState")),
+          active_(particles_->registerStateVariableData<int>("SupportGateActive")),
+          dose_(particles_->registerStateVariableData<Real>("SupportShiftDose")),
+          shift_(particles_->registerStateVariableData<Vecd>("SupportGateShift"))
+    {
+        particles_->addEvolvingVariable<int>("SupportGateState");
+        particles_->addEvolvingVariable<int>("SupportGateActive");
+        particles_->addEvolvingVariable<Real>("SupportShiftDose");
+        particles_->addEvolvingVariable<Vecd>("SupportGateShift");
+        particles_->addVariableToWrite<int>("SupportGateState");
+        particles_->addVariableToWrite<int>("SupportGateActive");
+        particles_->addVariableToWrite<Real>("SupportShiftDose");
+        particles_->addVariableToWrite<Vecd>("SupportGateShift");
+    }
+
+    // Called once per advective step before exec().
+    void set_step(Real dt_per_unit_T, bool dry)
+    {
+        dt_per_unit_T_ = dt_per_unit_T;
+        dry_ = dry;
+    }
+
+    void interaction(size_t index_i, Real dt = 0.0)
+    {
+        shift_[index_i] = Vecd::Zero();
+        active_[index_i] = 0;
+        if (!breakup_options.support_gate)
+            return;
+        if (state_[index_i] == 2 || eligible_[index_i] != 1 || dry_)
+            return;
+        if (deficit_[index_i] <= breakup_options.support_gate_act_deficit)
+            return;
+        if (layers_[index_i] < breakup_options.support_gate_min_layers)
+            return;
+        const Neighborhood &neighborhood = inner_configuration_[index_i];
+        if (neighborhood.current_size_ < 4)
+            return;
+
+        Vecd centroid = Vecd::Zero();
+        Real weight_sum = 0.0;
+        int neighbours_above = 0;
+        for (size_t n = 0; n != neighborhood.current_size_; ++n)
+        {
+            const size_t index_j = neighborhood.j_[n];
+            Real weight = neighborhood.W_ij_[n];
+            centroid += weight * (pos_[index_j] - pos_[index_i]);
+            weight_sum += weight;
+            if (deficit_[index_j] > breakup_options.support_gate_act_deficit)
+                ++neighbours_above;
+        }
+        if (neighbours_above < breakup_options.support_gate_min_neighbours)
+            return;
+        if (weight_sum <= TinyReal)
+            return;
+
+        Vecd d_now = centroid / weight_sum;
+        Real d_norm = d_now.norm();
+        if (d_norm <= TinyReal)
+            return;
+
+        Real budget = breakup_options.support_gate_budget_in_dx * ParticleSpacing();
+        Real remaining = budget - dose_[index_i];
+        if (remaining <= 0.0)
+        {
+            state_[index_i] = 2;
+            return;
+        }
+        Real magnitude = breakup_options.support_gate_rate_in_dx * ParticleSpacing() *
+                         dt_per_unit_T_;
+        if (magnitude > remaining)
+            magnitude = remaining;
+        // Direction is MINUS the neighbour centroid: moving toward the centroid
+        // was measured to point away from the missing support and widen the void.
+        shift_[index_i] = -magnitude * d_now / d_norm;
+        active_[index_i] = 1;
+    }
+
+    void update(size_t index_i, Real dt = 0.0)
+    {
+        if (active_[index_i] != 1)
+            return;
+        pos_[index_i] += shift_[index_i];
+        dose_[index_i] += shift_[index_i].norm();
+        state_[index_i] = 1;
+        if (dose_[index_i] >= breakup_options.support_gate_budget_in_dx * ParticleSpacing())
+            state_[index_i] = 2;   // budget exhausted, permanently off
+    }
+
+  private:
+    Vecd *pos_, *shift_;
+    Real *deficit_, *layers_, *dose_;
+    int *eligible_, *state_, *active_;
+    Real dt_per_unit_T_ = 0.0;
+    bool dry_ = false;
+};
+
 struct TopologyMetrics
 {
     Real dry_fraction = 0.0;
@@ -6436,6 +6811,20 @@ void WriteBreakupParameters(const std::string &output_folder)
          << ",tangential-only free-surface particle correction\n";
     file << "surface_regularization_coefficient," << breakup_options.surface_regularization_coefficient
          << ",free-surface tangential correction strength\n";
+    file << "support_gate," << (breakup_options.support_gate ? 1 : 0)
+         << ",gated internal support restoration (position-only, minus neighbour centroid)\n";
+    file << "support_gate_watch_deficit," << breakup_options.support_gate_watch_deficit
+         << ",delta recorded but never acted on\n";
+    file << "support_gate_act_deficit," << breakup_options.support_gate_act_deficit
+         << ",delta threshold that activates the correction\n";
+    file << "support_gate_rate_in_dx," << breakup_options.support_gate_rate_in_dx
+         << ",kappa: applied displacement per unit T in particle spacings\n";
+    file << "support_gate_budget_in_dx," << breakup_options.support_gate_budget_in_dx
+         << ",per-particle cumulative artificial displacement cap\n";
+    file << "support_gate_min_neighbours," << breakup_options.support_gate_min_neighbours
+         << ",neighbours that must also exceed the gate threshold\n";
+    file << "support_gate_min_layers," << breakup_options.support_gate_min_layers
+         << ",local film thickness floor in particle spacings\n";
     file << "surface_max_shift_dx," << breakup_options.surface_max_shift_in_dx
          << ",maximum tangential position correction per advection step\n";
     file << "surface_hourglass_coefficient," << breakup_options.surface_hourglass_coefficient
@@ -7045,6 +7434,10 @@ int SPHINXSYS_BREAKUP_ENTRY_POINT(int argc, char *argv[])
               << " density_reinit=" << (breakup_options.density_reinitialization ? "on" : "off")
               << " particle_regularization=" << (breakup_options.particle_regularization ? "on" : "off")
               << " surface_regularization=" << (breakup_options.surface_regularization ? "on" : "off")
+              << " support_gate=" << (breakup_options.support_gate ? "on" : "off")
+              << " support_gate_act=" << breakup_options.support_gate_act_deficit
+              << " support_gate_rate_dx_per_T=" << breakup_options.support_gate_rate_in_dx
+              << " support_gate_budget_dx=" << breakup_options.support_gate_budget_in_dx
               << " surface_hourglass=" << breakup_options.surface_hourglass_coefficient
               << " normal_reconstruction=" << breakup_options.normal_reconstruction
               << " jfm_neighbor_mode=" << breakup_options.jfm_neighbor_mode
@@ -7142,6 +7535,13 @@ int SPHINXSYS_BREAKUP_ENTRY_POINT(int argc, char *argv[])
     XuVanDerWaalsForce van_der_waals_force(liquid_inner);
     InteractionWithUpdate<TangentialSurfaceRegularization>
         regularize_surface_particles(liquid_inner);
+    // Gated support restoration: reference capture runs once, the thickness
+    // binning is serial, and the probe/correction pair runs every advective
+    // step.  Construction order fixes the state-variable registration order.
+    SimpleDynamics<SupportGateReferenceCapture> capture_support_reference(liquid_inner);
+    SupportGateFilmThickness support_gate_film_thickness(liquid);
+    InteractionWithUpdate<SupportGateDeficitProbe> support_gate_probe(liquid_inner);
+    InteractionWithUpdate<GatedSupportRestoration> support_gate(liquid_inner);
 
     Dynamics1Level<fluid_dynamics::Integration1stHalfWithWallRiemann>
         pressure_relaxation(liquid_inner, liquid_wall_contact);
@@ -7224,6 +7624,8 @@ int SPHINXSYS_BREAKUP_ENTRY_POINT(int argc, char *argv[])
     fibre_normals.exec();
     axis_symmetry_normals.exec();
     indicate_free_surface.exec();
+    if (breakup_options.support_gate)
+        capture_support_reference.exec();   // S_i(0) and the T=0 interior cohort
     local_capillary_force.exec();
     van_der_waals_force.exec();
     pressure_force_diagnostic.exec();
@@ -7887,9 +8289,22 @@ int SPHINXSYS_BREAKUP_ENTRY_POINT(int argc, char *argv[])
             if (breakup_options.surface_regularization &&
                 breakup_options.surface_regularization_coefficient > 0.0)
                 regularize_surface_particles.exec();
+            if (breakup_options.support_gate)
+            {
+                // Dt is the advective step in solver time; the gate rate is
+                // defined per unit of dimensionless time T = gamma t / (mu a),
+                // so convert before scaling: Delta x = kappa * Dt / T_scale.
+                bool support_gate_dry = support_gate_film_thickness.update_bins();
+                Real support_gate_dt_T =
+                    Dt / (DynamicViscosity() * fibre_radius / surface_tension);
+                support_gate_probe.exec();
+                support_gate.set_step(support_gate_dt_T, support_gate_dry);
+                support_gate.exec();
+            }
             if (run_options.FullAxisymmetric() &&
                 (breakup_options.particle_regularization ||
-                 breakup_options.surface_regularization))
+                 breakup_options.surface_regularization ||
+                 breakup_options.support_gate))
                 update_axisymmetric_weights.exec();
             if (breakup_options.post_breakup_models)
                 film_rupture.exec();
