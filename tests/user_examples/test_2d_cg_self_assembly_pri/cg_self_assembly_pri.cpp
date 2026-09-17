@@ -91,6 +91,17 @@ struct RunOptions
     Real temperature = 1.0; /**< k_B T in reduced units, fixed at 1 */
     Real friction = 1.0;    /**< gamma / sqrt(m eps0)/sigma, NOT yet calibrated */
 
+    // Particle-fibre wall potential (Case 2).  h is the distance from the
+    // particle CENTRE to the fibre SURFACE, so h = 0.5 sigma is geometric
+    // contact.  h is never a surface-to-surface gap.
+    Real wall_depth_d0 = 0.0;   /**< D0 == eps_pf / k_B T; 0 disables the wall */
+    Real wall_alpha = 3.0;      /**< inverse length, 3/sigma */
+    Real wall_re = 0.5;         /**< r0 / sigma, the well position = contact */
+    Real wall_cutoff = 2.5;     /**< r_c / sigma */
+    Real wall_guard_h = 0.10;   /**< numerical backstop when D0 > 0 */
+    Real wall_contact_h = 0.50; /**< hard-wall location used when D0 = 0 */
+    Real adsorption_cutoff_h = 1.5; /**< h_ads for f_ads */
+
     Real initial_separation = 1.0;
     Real exclusion_margin = 0.50;
     std::string initial_velocity = "maxwell";
@@ -283,6 +294,72 @@ Real PairStiffness(Real r)
 }
 
 //=============================================================================
+//  Particle-fibre Morse wall (Case 2)
+//
+//  h is the distance from the particle CENTRE to the fibre SURFACE.
+//  With the fibre modelled as a strip of half width a centred at y = Ly/2,
+//      h = |y - Ly/2| - a.
+//  h = 0.5 sigma is therefore geometric contact for a particle of diameter
+//  sigma, and that is where the Morse well sits (r0 = 0.5 sigma).
+//
+//      E_raw(h) = D0 [ exp(-2 alpha (h - r0)) - 2 exp(-alpha (h - r0)) ]
+//      E(h)     = E_raw(h) - E_raw(r_c)                    (h < r_c), else 0
+//      F(h)     = -dE/dh = 2 alpha D0 [ exp(-2 alpha (h-r0)) - exp(-alpha (h-r0)) ]
+//                 positive = away from the wall (repulsion)
+//
+//  NOTE ON A SIGN TYPO IN THE LITERATURE INTERFACE: that document writes
+//  F = -2 alpha D0 ( exp(-2x) - exp(-x) ), which is the negative of -dE/dh.
+//  Its own analytic numbers ("repulsion at h = 0.4 sigma is +2.83 D0/sigma")
+//  and the quoted LAMMPS source line both correspond to the expression used
+//  here; with the printed minus sign the wall would repel where it must
+//  attract.  The physical requirement (a well at h = r0, attraction for
+//  h > r0) settles it.
+//=============================================================================
+Real WallAlpha() { return run_options.wall_alpha / Sigma(); }
+Real WallRe() { return run_options.wall_re * Sigma(); }
+Real WallCutoff() { return run_options.wall_cutoff * Sigma(); }
+
+/** Distance from the particle centre to the nearest fibre surface. */
+inline Real WallDistance(const Vecd &p)
+{
+    return std::abs(p[1] - FibreCentreY()) - FibreHalfWidth();
+}
+
+Real WallRawPotential(Real h)
+{
+    const Real d0 = run_options.wall_depth_d0;
+    if (d0 <= 0.0)
+        return 0.0;
+    const Real x = WallAlpha() * (h - WallRe());
+    return d0 * (std::exp(-2.0 * x) - 2.0 * std::exp(-x));
+}
+
+/** Positive means push the particle away from the fibre. */
+Real WallForce(Real h)
+{
+    const Real d0 = run_options.wall_depth_d0;
+    if (d0 <= 0.0 || h >= WallCutoff())
+        return 0.0;
+    const Real alpha = WallAlpha();
+    const Real x = alpha * (h - WallRe());
+    return 2.0 * d0 * alpha * (std::exp(-2.0 * x) - std::exp(-x));
+}
+
+/** Depth of the shifted well, measured from the shifted zero at r_c. */
+Real WallEffectiveDepth()
+{
+    if (run_options.wall_depth_d0 <= 0.0)
+        return 0.0;
+    return run_options.wall_depth_d0 + WallRawPotential(WallCutoff());
+}
+
+Real WallStiffness(Real h)
+{
+    const Real d = 1.0e-4 * Sigma();
+    return -(WallForce(h + d) - WallForce(h - d)) / (2.0 * d);
+}
+
+//=============================================================================
 //  Counter-based deterministic normal deviates
 //=============================================================================
 inline std::uint64_t SplitMix64(std::uint64_t z)
@@ -391,6 +468,20 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.temperature = ToReal(a, "--temperature=");
         else if (StartsWith(a, "--friction="))
             run_options.friction = ToReal(a, "--friction=");
+        else if (StartsWith(a, "--wall-depth-d0="))
+            run_options.wall_depth_d0 = ToReal(a, "--wall-depth-d0=");
+        else if (StartsWith(a, "--wall-alpha="))
+            run_options.wall_alpha = ToReal(a, "--wall-alpha=");
+        else if (StartsWith(a, "--wall-re="))
+            run_options.wall_re = ToReal(a, "--wall-re=");
+        else if (StartsWith(a, "--wall-cutoff="))
+            run_options.wall_cutoff = ToReal(a, "--wall-cutoff=");
+        else if (StartsWith(a, "--wall-guard-h="))
+            run_options.wall_guard_h = ToReal(a, "--wall-guard-h=");
+        else if (StartsWith(a, "--wall-contact-h="))
+            run_options.wall_contact_h = ToReal(a, "--wall-contact-h=");
+        else if (StartsWith(a, "--adsorption-cutoff-h="))
+            run_options.adsorption_cutoff_h = ToReal(a, "--adsorption-cutoff-h=");
         else if (StartsWith(a, "--initial-separation="))
             run_options.initial_separation = ToReal(a, "--initial-separation=");
         else if (StartsWith(a, "--exclusion-margin="))
@@ -441,6 +532,21 @@ void ParseCommandLine(int argc, char *argv[])
         throw std::runtime_error("--initial-separation is outside the pair cut-off.");
     if (run_options.frames < 2)
         throw std::runtime_error("--frames must be at least 2.");
+    if (run_options.wall_depth_d0 < 0.0)
+        throw std::runtime_error("--wall-depth-d0 must be non-negative.");
+    if (run_options.wall_depth_d0 > 0.0)
+    {
+        if (run_options.wall_alpha <= 0.0)
+            throw std::runtime_error("--wall-alpha must be positive.");
+        if (run_options.wall_re <= 0.0 || run_options.wall_cutoff <= run_options.wall_re)
+            throw std::runtime_error("wall well position / cut-off are inconsistent.");
+        // The Morse wall already carries the near-wall repulsion; the guard is
+        // a numerical backstop only and must sit well inside the well.
+        if (run_options.wall_guard_h >= run_options.wall_re)
+            throw std::runtime_error(
+                "--wall-guard-h must be smaller than --wall-re, otherwise the "
+                "guard would double up with the Morse wall repulsion.");
+    }
 }
 
 //=============================================================================
@@ -648,28 +754,42 @@ class CGConstraints : public LocalDynamics
         : LocalDynamics(real_body),
           pos_(particles_->getVariableDataByName<Vecd>("Position")),
           vel_(particles_->getVariableDataByName<Vecd>("Velocity")),
-          wrap_count_(0), inside_fibre_count_(0), escaped_count_(0) {}
+          wrap_count_(0), wall_guard_hits_(0), wall_contact_hits_(0),
+          escaped_count_(0) {}
 
     void exec(Real dt = 0.0)
     {
         wrap_count_ = 0;
-        inside_fibre_count_ = 0;
+        wall_guard_hits_ = 0;
+        wall_contact_hits_ = 0;
         escaped_count_ = 0;
 
         const Real lx = DomainLength();
         const Real ly = DomainHeight();
         const Real centre_y = FibreCentreY();
-        const Real exclusion = ExclusionRadius();
+        // With the Morse wall switched on its own h < r0 branch already
+        // provides the near-wall repulsion, so the geometric constraint is
+        // demoted to a numerical backstop placed far inside the well.
+        // With D0 = 0 there is no wall potential at all and the constraint is
+        // the physical hard wall, placed at geometric contact r0 = 0.5 sigma
+        // so that the excluded volume matches the Morse case.
+        const bool morse_wall = run_options.wall_depth_d0 > 0.0;
+        const Real wall_limit =
+            FibreHalfWidth() + (morse_wall ? run_options.wall_guard_h
+                                           : run_options.wall_contact_h) * Sigma();
         const size_t total = particles_->TotalRealParticles();
 
         for (size_t i = 0; i != total; ++i)
         {
             Real offset = pos_[i][1] - centre_y;
-            if (std::abs(offset) < exclusion)
+            if (std::abs(offset) < wall_limit)
             {
-                ++inside_fibre_count_;
+                if (morse_wall)
+                    ++wall_guard_hits_;
+                else
+                    ++wall_contact_hits_;
                 const Real sign = (offset >= 0.0) ? 1.0 : -1.0;
-                pos_[i][1] = centre_y + sign * exclusion;
+                pos_[i][1] = centre_y + sign * wall_limit;
                 // Elastic (specular) bounce off the fibre core.  Reflecting the
                 // normal velocity keeps the constraint dissipation-free, so it
                 // does not act as a hidden energy sink that would bias the
@@ -700,15 +820,51 @@ class CGConstraints : public LocalDynamics
     }
 
     size_t WrapCount() const { return wrap_count_; }
-    size_t InsideFibreCount() const { return inside_fibre_count_; }
+    size_t WallGuardHits() const { return wall_guard_hits_; }
+    size_t WallContactHits() const { return wall_contact_hits_; }
     size_t EscapedCount() const { return escaped_count_; }
 
   private:
     Vecd *pos_;
     Vecd *vel_;
     size_t wrap_count_;
-    size_t inside_fibre_count_;
+    size_t wall_guard_hits_;
+    size_t wall_contact_hits_;
     size_t escaped_count_;
+};
+
+//=============================================================================
+//  Particle-fibre wall force.  Runs after the pair interaction and ADDS to the
+//  stored force, so the pair interaction must always be evaluated first.
+//=============================================================================
+class CGWallForce : public LocalDynamics
+{
+  public:
+    explicit CGWallForce(RealBody &real_body)
+        : LocalDynamics(real_body),
+          pos_(particles_->getVariableDataByName<Vecd>("Position")),
+          force_(particles_->template getVariableDataByName<Vecd>("CG_Force")) {}
+
+    void exec(Real dt = 0.0)
+    {
+        if (run_options.wall_depth_d0 <= 0.0)
+            return;
+        const Real centre_y = FibreCentreY();
+        const size_t total = particles_->TotalRealParticles();
+        for (size_t i = 0; i != total; ++i)
+        {
+            const Real offset = pos_[i][1] - centre_y;
+            const Real h = std::abs(offset) - FibreHalfWidth();
+            if (h >= WallCutoff())
+                continue;
+            const Real sign = (offset >= 0.0) ? 1.0 : -1.0;
+            force_[i][1] += sign * WallForce(h);
+        }
+    }
+
+  private:
+    Vecd *pos_;
+    Vecd *force_;
 };
 
 //=============================================================================
@@ -839,7 +995,8 @@ struct FrameDiagnostics
     Real max_speed = 0.0;
     Real kinetic_temperature = 0.0; /**< <v^2> / (d k_B T / m); 1 at equilibrium */
     Real mean_height_above_fibre = 0.0;
-    size_t inside_fibre = 0;
+    Real f_ads = 0.0;      /**< fraction of particles with h < h_ads */
+    Real wall_min_h = 0.0; /**< smallest particle-surface distance, in sigma */
     size_t escaped = 0;
     Real max_abs_vy = 0.0;
 };
@@ -855,20 +1012,26 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
     const int dimensions = 2;
     Real depth_sum = 0.0;
     Real v2_sum = 0.0;
+    Real min_h = std::numeric_limits<Real>::max();
+    size_t bound = 0;
     for (size_t i = 0; i != d.particle_number; ++i)
     {
         const Real v2 = vel[i].squaredNorm();
         v2_sum += v2;
         d.max_speed = std::max(d.max_speed, std::sqrt(v2));
         d.max_abs_vy = std::max(d.max_abs_vy, std::abs(vel[i][1]));
-        depth_sum += std::abs(pos[i][1] - centre_y) - FibreHalfWidth();
-        if (std::abs(pos[i][1] - centre_y) < ExclusionRadius() - 1.0e-9)
-            ++d.inside_fibre;
+        const Real h = std::abs(pos[i][1] - centre_y) - FibreHalfWidth();
+        depth_sum += h;
+        min_h = std::min(min_h, h);
+        if (h < run_options.adsorption_cutoff_h * Sigma())
+            ++bound;
         if (pos[i][1] < -0.01 * DomainHeight() || pos[i][1] > 1.01 * DomainHeight())
             ++d.escaped;
     }
     const Real n = static_cast<Real>(d.particle_number);
     d.mean_height_above_fibre = depth_sum / n;
+    d.wall_min_h = (min_h == std::numeric_limits<Real>::max()) ? 0.0 : min_h / Sigma();
+    d.f_ads = static_cast<Real>(bound) / n;
     d.kinetic_temperature =
         v2_sum / (n * static_cast<Real>(dimensions) * run_options.temperature);
     return d;
@@ -887,8 +1050,20 @@ int main(int ac, char *av[])
     const Real omega = std::sqrt(stiffness / (0.5)); /**< reduced mass m/2 with m = 1 */
     const Real dt_limit = 2.0 / omega;
     const Real dt_auto = run_options.dt_cfl * dt_limit;
-    const Real dt = (run_options.dt > 0.0) ? run_options.dt : dt_auto;
     const Real eps_eff_over_kBT = EffectiveWellDepth() / run_options.temperature;
+    const Real wall_eps_eff_over_kBT =
+        WallEffectiveDepth() / run_options.temperature;
+    // The wall adds its own stiffness.  Evaluate it at a reference stand-off
+    // that is a little outside the numerical guard, since a particle can never
+    // legitimately get closer than that.
+    const Real wall_h_ref = 1.5 * run_options.wall_guard_h * Sigma();
+    const Real wall_stiffness =
+        run_options.wall_depth_d0 > 0.0 ? WallStiffness(wall_h_ref) : 0.0;
+    const Real wall_omega = std::sqrt(std::max(wall_stiffness, 0.0));
+    const Real wall_dt_limit = wall_omega > TinyReal ? 2.0 / wall_omega : 1.0e9;
+    const Real dt_auto_wall =
+        run_options.dt_cfl * std::min(dt_limit, wall_dt_limit);
+    const Real dt = (run_options.dt > 0.0) ? run_options.dt : dt_auto_wall;
 
     const Vecd domain_lower(0.0, 0.0);
     const Vecd domain_upper(DomainLength(), DomainHeight());
@@ -925,9 +1100,21 @@ int main(int ac, char *av[])
               << "  eps_eff(k_BT)=" << eps_eff_over_kBT
               << "  (D/k_BT=" << run_options.morse_depth / run_options.temperature
               << "); combined WCA+Morse well depth\n"
-              << "  dt=" << dt << " (auto limit " << dt_auto
-              << " from stiffness " << stiffness << " at r="
-              << run_options.dt_reference_separation << ")\n";
+              << "  wall: D0=" << run_options.wall_depth_d0
+              << " eps_wall_eff(k_BT)=" << wall_eps_eff_over_kBT
+              << " alpha=" << WallAlpha() << " r0=" << WallRe()
+              << " rc=" << WallCutoff() << " shifted_potential\n"
+              << "        h = |y - Ly/2| - a  (centre to fibre SURFACE;"
+                 " h=0.5 sigma is contact)\n"
+              << "        guard_h=" << (run_options.wall_depth_d0 > 0.0
+                                           ? run_options.wall_guard_h
+                                           : run_options.wall_contact_h)
+              << (run_options.wall_depth_d0 > 0.0
+                      ? " (numerical backstop)" : " (PHYSICAL hard wall, D0=0)")
+              << " h_ads=" << run_options.adsorption_cutoff_h << "\n"
+              << "  dt=" << dt << " (auto pair limit " << dt_auto
+              << ", wall limit " << wall_dt_limit
+              << ", chosen " << dt_auto_wall << ")\n";
 
     //-------------------------------------------------------------------------
     //  Bodies
@@ -947,6 +1134,7 @@ int main(int ac, char *av[])
     //  Dynamics
     //-------------------------------------------------------------------------
     InteractionWithUpdate<CGPairInteraction> pair_interaction(particles_inner);
+    CGWallForce wall_force(particles_body);
     CGInitialVelocity initial_velocity(particles_body);
     CGLangevinKick langevin_kick(particles_body);
     CGHalfDrift half_drift(particles_body);
@@ -1002,6 +1190,35 @@ int main(int ac, char *av[])
         row("eps_eff_over_kBT",
             std::to_string(eps_eff_over_kBT),
             "report this alongside D/k_BT");
+        row("wall_depth_D0", std::to_string(run_options.wall_depth_d0),
+            "nominal eps_pf / k_BT; 0 disables the wall potential");
+        row("wall_effective_depth",
+            std::to_string(WallEffectiveDepth()),
+            "depth of the SHIFTED well; slightly below D0");
+        row("wall_effective_depth_over_kBT",
+            std::to_string(wall_eps_eff_over_kBT),
+            "report this alongside wall_depth_D0");
+        row("wall_energy_at_cutoff", std::to_string(WallRawPotential(WallCutoff())),
+            "E_raw(rc) subtracted by the shift");
+        row("wall_force_step_at_cutoff", std::to_string(WallForce(WallCutoff())),
+            "residual force dropped at rc");
+        row("wall_alpha", std::to_string(WallAlpha()), "inverse length, 3/sigma");
+        row("wall_re", std::to_string(WallRe()),
+            "well position = geometric contact = 0.5 sigma");
+        row("wall_cutoff", std::to_string(WallCutoff()), "2.5 sigma");
+        row("wall_shift_type", "shifted potential (energy shift only)",
+            "E = E_raw(h) - E_raw(rc) for h < rc");
+        row("wall_h_definition",
+            "h = |y - Ly/2| - fibre_half_width (centre to SURFACE)",
+            "NOT centre to axis, and NOT a surface-to-surface gap");
+        row("wall_guard_h", std::to_string(run_options.wall_guard_h),
+            "numerical backstop; only meaningful when D0 > 0");
+        row("wall_contact_h", std::to_string(run_options.wall_contact_h),
+            "hard-wall stand-off used when D0 = 0 to match the excluded volume");
+        row("adsorption_cutoff_h", std::to_string(run_options.adsorption_cutoff_h),
+            "h_ads for f_ads");
+        row("wall_dt_limit", std::to_string(wall_dt_limit),
+            "2/omega from the wall stiffness at 1.5*guard_h");
         row("morse_formula",
             "U_M(r) = D*[exp(-2*alpha*(r-r_e)) - 2*exp(-alpha*(r-r_e))]",
             "alpha is an INVERSE length; there is no length parameter 'a'");
@@ -1049,11 +1266,14 @@ int main(int ac, char *av[])
 
     pair_interaction.ResetCounters();
     pair_interaction.exec();
+    wall_force.exec();
 
     std::ofstream selfcheck("selfcheck.csv");
     selfcheck << "time,particles,kinetic_temperature,D_over_kBT,eps_eff_over_kBT,"
+                 "wall_D0_over_kBT,wall_eps_eff_over_kBT,"
                  "max_speed,max_abs_vy,"
-                 "min_neighbour_distance,mean_height_above_fibre,inside_fibre_count,"
+                 "min_neighbour_distance,mean_height_above_fibre,f_ads,wall_min_h,"
+                 "wall_guard_hits,wall_contact_hits,"
                  "wrapped_count,escaped_count,periodic_pairs,dt,steps\n";
     selfcheck << std::setprecision(10);
 
@@ -1063,9 +1283,14 @@ int main(int ac, char *av[])
                   << d.kinetic_temperature << ","
                   << run_options.morse_depth / run_options.temperature << ","
                   << eps_eff_over_kBT << ","
+                  << run_options.wall_depth_d0 / run_options.temperature << ","
+                  << wall_eps_eff_over_kBT << ","
                   << d.max_speed << ","
                   << d.max_abs_vy << "," << pair_interaction.MinimumSeparation() << ","
-                  << d.mean_height_above_fibre << "," << constraints.InsideFibreCount()
+                  << d.mean_height_above_fibre << "," << d.f_ads << ","
+                  << d.wall_min_h << ","
+                  << constraints.WallGuardHits() << ","
+                  << constraints.WallContactHits()
                   << "," << constraints.WrapCount() << "," << d.escaped << ","
                   << pair_interaction.PeriodicPairCount() << "," << dt_now << ","
                   << steps << "\n";
@@ -1075,7 +1300,10 @@ int main(int ac, char *av[])
                   << " T_kin=" << d.kinetic_temperature
                   << " max_speed=" << d.max_speed
                   << " min_sep=" << pair_interaction.MinimumSeparation()
-                  << " inside_fibre=" << constraints.InsideFibreCount()
+                  << " f_ads=" << d.f_ads
+                  << " h_min=" << d.wall_min_h
+                  << " guard=" << constraints.WallGuardHits()
+                  << " hard=" << constraints.WallContactHits()
                   << " wrapped=" << constraints.WrapCount()
                   << " periodic_pairs=" << pair_interaction.PeriodicPairCount()
                   << " dt=" << dt_now << "\n";
@@ -1114,6 +1342,7 @@ int main(int ac, char *av[])
         particles_inner.updateConfiguration();
 
         pair_interaction.exec(dt_now);
+        wall_force.exec(dt_now);
         langevin_kick.exec(dt_now);   // B/2 with F(x_new)
 
         physical_time += dt_now;
