@@ -102,6 +102,7 @@ struct RunOptions
     int frames = 100;
     bool y_reflect = true;
     std::string output_tag = "cg_case0";
+    std::string git_commit = CG_GIT_COMMIT;
 };
 
 RunOptions run_options;
@@ -218,6 +219,61 @@ Real MorseForce(Real r)
 }
 
 Real PairForce(Real r) { return WCAForce(r) + MorseForce(r); }
+
+/** Total conservative pair potential, WCA + shifted Morse. */
+Real PairPotential(Real r)
+{
+    Real u = 0.0;
+    const Real eps = run_options.wca_epsilon;
+    if (r < WCACutoff() && r > TinyReal)
+    {
+        const Real s = Sigma() / r;
+        const Real s6 = s * s * s * s * s * s;
+        u += 4.0 * eps * (s6 * s6 - s6) + eps;
+    }
+    if (run_options.morse_depth > 0.0 && r < MorseCutoff())
+        u += MorsePotential(r) - MorsePotential(MorseCutoff());
+    return u;
+}
+
+/**
+ * eps_eff: the depth of the ACTUAL well of the combined potential, found by a
+ * dense scan plus a parabolic refinement.  It differs from D because r_e = sigma
+ * lies inside the WCA core, which pushes the combined minimum out to the WCA
+ * cut-off.  Reporting both D/k_BT and eps_eff/k_BT keeps the two apart.
+ */
+Real EffectiveWellDepth()
+{
+    if (run_options.morse_depth <= 0.0)
+        return 0.0;
+    const Real lo = 0.6 * Sigma();
+    const Real hi = std::max(MorseCutoff(), 1.2 * Sigma());
+    const int samples = 20000;
+    Real best_r = lo, best_u = PairPotential(lo);
+    for (int k = 0; k <= samples; ++k)
+    {
+        const Real r = lo + (hi - lo) * static_cast<Real>(k) / samples;
+        const Real u = PairPotential(r);
+        if (u < best_u)
+        {
+            best_u = u;
+            best_r = r;
+        }
+    }
+    const Real h = 1.0e-4 * Sigma();
+    for (int it = 0; it != 60; ++it)
+    {
+        const Real u_l = PairPotential(best_r - h);
+        const Real u_c = PairPotential(best_r);
+        const Real u_r = PairPotential(best_r + h);
+        const Real d1 = (u_r - u_l) / (2.0 * h);
+        const Real d2 = (u_r - 2.0 * u_c + u_l) / (h * h);
+        if (std::abs(d2) < TinyReal)
+            break;
+        best_r -= d1 / d2;
+    }
+    return -PairPotential(best_r);
+}
 
 /** -dF/dr of the total pair force, by central difference at a reference r. */
 Real PairStiffness(Real r)
@@ -353,6 +409,8 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.y_reflect = ToInt(a, "--y-reflect=") != 0;
         else if (StartsWith(a, "--output-tag="))
             run_options.output_tag = ToString(a, "--output-tag=");
+        else if (StartsWith(a, "--git-commit="))
+            run_options.git_commit = ToString(a, "--git-commit=");
     }
 
     if (run_options.case_id != 0 && run_options.case_id != 1)
@@ -830,6 +888,7 @@ int main(int ac, char *av[])
     const Real dt_limit = 2.0 / omega;
     const Real dt_auto = run_options.dt_cfl * dt_limit;
     const Real dt = (run_options.dt > 0.0) ? run_options.dt : dt_auto;
+    const Real eps_eff_over_kBT = EffectiveWellDepth() / run_options.temperature;
 
     const Vecd domain_lower(0.0, 0.0);
     const Vecd domain_upper(DomainLength(), DomainHeight());
@@ -842,6 +901,7 @@ int main(int ac, char *av[])
 
     const int target_number = TargetParticleNumber();
     std::cout << "CG self-assembly prototype -- Langevin revision\n"
+              << "  git_commit=" << run_options.git_commit << "\n"
               << "  case=" << run_options.case_id
               << " seed=" << run_options.seed
               << " threads=" << run_options.threads << "\n"
@@ -862,6 +922,9 @@ int main(int ac, char *av[])
               << " cutoff=" << run_options.morse_cutoff
               << " truncation=shifted_potential\n"
               << "  Morse form: U_M(r) = D[exp(-2 alpha (r - r_e)) - 2 exp(-alpha (r - r_e))]\n"
+              << "  eps_eff(k_BT)=" << eps_eff_over_kBT
+              << "  (D/k_BT=" << run_options.morse_depth / run_options.temperature
+              << "); combined WCA+Morse well depth\n"
               << "  dt=" << dt << " (auto limit " << dt_auto
               << " from stiffness " << stiffness << " at r="
               << run_options.dt_reference_separation << ")\n";
@@ -912,6 +975,8 @@ int main(int ac, char *av[])
         };
         csv << "parameter,value,description\n";
         row("schema", "cg-fiber-selfassembly/run-parameters", "written by this case");
+        row("git_commit", run_options.git_commit,
+            "source revision baked in at build time; --git-commit overrides");
         row("case", std::to_string(run_options.case_id),
             "0 = WCA + Langevin, 1 = WCA + Morse + Langevin");
         row("seed", std::to_string(run_options.seed), "drives the counter-based noise");
@@ -929,6 +994,14 @@ int main(int ac, char *av[])
         row("wca_sigma", std::to_string(Sigma()), "");
         row("wca_cutoff", std::to_string(WCACutoff()), "2^(1/6) sigma, energy shifted");
         row("morse_depth_D", std::to_string(run_options.morse_depth), "0 disables");
+        row("morse_D_over_kBT",
+            std::to_string(run_options.morse_depth / run_options.temperature),
+            "this is the MORSE parameter D, not the depth of the combined well");
+        row("eps_eff", std::to_string(eps_eff_over_kBT * run_options.temperature),
+            "actual depth of the combined WCA+Morse well");
+        row("eps_eff_over_kBT",
+            std::to_string(eps_eff_over_kBT),
+            "report this alongside D/k_BT");
         row("morse_formula",
             "U_M(r) = D*[exp(-2*alpha*(r-r_e)) - 2*exp(-alpha*(r-r_e))]",
             "alpha is an INVERSE length; there is no length parameter 'a'");
@@ -978,7 +1051,8 @@ int main(int ac, char *av[])
     pair_interaction.exec();
 
     std::ofstream selfcheck("selfcheck.csv");
-    selfcheck << "time,particles,kinetic_temperature,max_speed,max_abs_vy,"
+    selfcheck << "time,particles,kinetic_temperature,D_over_kBT,eps_eff_over_kBT,"
+                 "max_speed,max_abs_vy,"
                  "min_neighbour_distance,mean_height_above_fibre,inside_fibre_count,"
                  "wrapped_count,escaped_count,periodic_pairs,dt,steps\n";
     selfcheck << std::setprecision(10);
@@ -986,7 +1060,10 @@ int main(int ac, char *av[])
     auto report = [&](Real time, Real dt_now, size_t steps, bool write_frame) {
         const FrameDiagnostics d = CollectDiagnostics(particles_body);
         selfcheck << time << "," << d.particle_number << ","
-                  << d.kinetic_temperature << "," << d.max_speed << ","
+                  << d.kinetic_temperature << ","
+                  << run_options.morse_depth / run_options.temperature << ","
+                  << eps_eff_over_kBT << ","
+                  << d.max_speed << ","
                   << d.max_abs_vy << "," << pair_interaction.MinimumSeparation() << ","
                   << d.mean_height_above_fibre << "," << constraints.InsideFibreCount()
                   << "," << constraints.WrapCount() << "," << d.escaped << ","
