@@ -98,6 +98,11 @@ struct RunOptions
     Real cluster_aspect = 2.5;          /**< long/short axis ratio */
     Real cluster_packing = 0.63;        /**< area fraction of the lattice */
     int cluster_count = 800;            /**< particles in the cluster */
+    // A-2 wetting lever.  The aggregate is always centred on the fibre centre,
+    // so a strip wall would bisect it.  This offset TRANSLATES the finished
+    // aggregate in y only; it touches no force, no integrator and no wall term.
+    // The default 0 reproduces the pre-A-2 placement exactly.
+    Real cluster_offset_y = 0.0; /**< y shift of the cluster centre, in sigma */
     Real area_fraction = 0.20;
     Real resolution = 2.0; /**< SPH lattice points per unit length */
 
@@ -577,6 +582,8 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.cluster_packing = ToReal(a, "--cluster-packing=");
         else if (StartsWith(a, "--cluster-count="))
             run_options.cluster_count = ToInt(a, "--cluster-count=");
+        else if (StartsWith(a, "--cluster-offset-y="))
+            run_options.cluster_offset_y = ToReal(a, "--cluster-offset-y=");
         else if (StartsWith(a, "--interface-gradient-lambda="))
             run_options.interface_lambda = ToReal(a, "--interface-gradient-lambda=");
         else if (StartsWith(a, "--interface-gradient-h="))
@@ -910,6 +917,15 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
         if (2.0 * half_l >= DomainLength() - 2.0 * sigma ||
             2.0 * half_w >= DomainHeight() - 2.0 * sigma)
             throw std::runtime_error("cluster does not fit inside the domain.");
+        // A-2: the aggregate is placed on (0.5 Lx, FibreCentreY() + offset).
+        // The default offset 0 is the original placement; a positive offset
+        // lifts the aggregate clear of a strip wall so that no particle starts
+        // inside the wall (those would be projected onto the surface at the
+        // first constraint pass and collapse neighbouring lattice rows).
+        const Real centre_y = FibreCentreY() + run_options.cluster_offset_y;
+        if (centre_y - half_w < sigma || centre_y + half_w > DomainHeight() - sigma)
+            throw std::runtime_error(
+                "--cluster-offset-y places the cluster outside the domain.");
 
         const Real row = 0.5 * std::sqrt(3.0) * d;
         const int nx = static_cast<int>(std::ceil(half_l / d)) + 2;
@@ -946,7 +962,7 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
             chosen.push_back(sites[static_cast<size_t>(k)].second);
             sum += sites[static_cast<size_t>(k)].second;
         }
-        const Vecd shift(0.5 * DomainLength(), FibreCentreY());
+        const Vecd shift(0.5 * DomainLength(), centre_y);
         const Vecd centre = sum / static_cast<Real>(run_options.cluster_count);
         for (const Vecd &p : chosen)
             addPositionAndVolumetricMeasure(p - centre + shift, 1.0);
@@ -956,7 +972,9 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
                   << " N=" << run_options.cluster_count
                   << " packing=" << phi << " lattice_d=" << d
                   << " area=" << area
-                  << " half_sizes=" << half_l << " x " << half_w << "\n";
+                  << " half_sizes=" << half_l << " x " << half_w
+                  << " centre_y=" << centre_y
+                  << " offset_y=" << run_options.cluster_offset_y << "\n";
     }
 
     /**
@@ -1775,6 +1793,8 @@ static int RunCgCase(int ac, char *av[])
             "area fraction of the initial triangular lattice");
         row("cluster_count", std::to_string(run_options.cluster_count),
             "particles in the initial cluster");
+        row("cluster_offset_y", std::to_string(run_options.cluster_offset_y),
+            "y shift of the cluster centre; 0 = original placement on the axis");
         row("particle_spacing", std::to_string(spacing), "2h = 2.6 dx >= pair cutoff");
         row("dt", std::to_string(dt), run_options.dt > 0.0 ? "user" : "automatic");
         row("dt_stability_limit", std::to_string(dt_limit),
