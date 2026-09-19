@@ -77,6 +77,16 @@ struct RunOptions
     Real domain_length = 60.0;
     Real domain_height = 40.0;
     Real fibre_half_width = 5.0;
+    // Fibre cross-section / extent.  "strip" is the original geometry: a flat
+    // ribbon of half-width fibre_half_width that spans the whole x period, so
+    // it has no curvature.  "cylinder" is a capsule: a straight segment of
+    // length fibre_length with two half-disc caps of radius fibre_radius, i.e.
+    // a finite-radius fibre of finite length whose caps DO have curvature.
+    // The physics (both potentials, thermostat, units) is identical; only the
+    // function h(x) that measures the distance to the fibre surface changes.
+    std::string fibre_shape = "strip"; /**< strip | cylinder */
+    Real fibre_radius = 5.0;           /**< cap radius of the cylinder fibre */
+    Real fibre_length = 60.0;          /**< straight-segment length of it */
     Real area_fraction = 0.20;
     Real resolution = 2.0; /**< SPH lattice points per unit length */
 
@@ -122,16 +132,91 @@ Real DomainLength() { return run_options.domain_length; }
 Real DomainHeight() { return run_options.domain_height; }
 Real FibreHalfWidth() { return run_options.fibre_half_width; }
 Real FibreCentreY() { return 0.5 * DomainHeight(); }
-Real ExclusionRadius() { return FibreHalfWidth() + run_options.exclusion_margin; }
+Real FibreRadius()
+{
+    return (run_options.fibre_shape == "cylinder") ? run_options.fibre_radius
+                                                   : FibreHalfWidth();
+}
+Real FibreLength()
+{
+    return (run_options.fibre_shape == "cylinder") ? run_options.fibre_length
+                                                   : DomainLength();
+}
+Real ExclusionRadius() { return FibreRadius() + run_options.exclusion_margin; }
 Real Sigma() { return run_options.sigma; }
 Real WCACutoff() { return std::pow(2.0, 1.0 / 6.0) * Sigma(); }
 
 Real LargestPairCutoff();
 
+/**
+ * Centre-to-surface distance h together with the outward surface normal.
+ * h < 0 means the point is inside the fibre.  For the flat strip the normal is
+ * along y; for the capsule it is radial on the shaft and points away from the
+ * nearest cap centre outside it.
+ */
+struct FibreContact
+{
+    Real h;
+    Vecd normal;
+};
+
+inline Real PeriodicOffsetX(Real x)
+{
+    const Real lx = DomainLength();
+    Real dx = x - 0.5 * lx;
+    dx -= lx * std::floor(dx / lx + 0.5);
+    return dx;
+}
+
+inline FibreContact FibreContactOf(const Vecd &p)
+{
+    const Real dy = p[1] - FibreCentreY();
+    FibreContact c;
+    if (run_options.fibre_shape == "none")
+    {
+        c.h = 1.0e9;          // no fibre at all: no exclusion, no wall force
+        c.normal = Vecd(0.0, 1.0);
+        return c;
+    }
+    if (run_options.fibre_shape == "cylinder")
+    {
+        const Real dx = PeriodicOffsetX(p[0]);
+        const Real half_length = 0.5 * FibreLength();
+        const Real s = dx - std::min(std::max(dx, -half_length), half_length);
+        const Real d = std::sqrt(s * s + dy * dy);
+        c.h = d - FibreRadius();
+        if (d > 1.0e-12)
+            c.normal = Vecd(s / d, dy / d);
+        else
+            c.normal = Vecd(0.0, 1.0);
+        return c;
+    }
+    c.h = std::abs(dy) - FibreHalfWidth();
+    c.normal = Vecd(0.0, (dy >= 0.0) ? 1.0 : -1.0);
+    return c;
+}
+
+/** Area occupied by the fibre (used only to convert area fraction to N). */
+Real FibreArea()
+{
+    if (run_options.fibre_shape == "none")
+        return 0.0;
+    if (run_options.fibre_shape == "cylinder")
+        return FibreLength() * 2.0 * FibreRadius() + Pi * FibreRadius() * FibreRadius();
+    return 2.0 * FibreHalfWidth() * DomainLength();
+}
+
+/** Perimeter that can be covered: the 2D "circumference" analogue. */
+Real FibrePerimeter()
+{
+    if (run_options.fibre_shape == "cylinder")
+        return 2.0 * FibreLength() + 2.0 * Pi * FibreRadius();
+    return 2.0 * DomainLength();
+}
+
 Real FreeArea()
 {
-    return DomainLength() * DomainHeight() -
-           2.0 * FibreHalfWidth() * DomainLength();
+    return DomainLength() * DomainHeight() - FibreArea();
 }
 
 int TargetParticleNumber()
@@ -322,7 +407,7 @@ Real WallCutoff() { return run_options.wall_cutoff * Sigma(); }
 /** Distance from the particle centre to the nearest fibre surface. */
 inline Real WallDistance(const Vecd &p)
 {
-    return std::abs(p[1] - FibreCentreY()) - FibreHalfWidth();
+    return FibreContactOf(p).h;
 }
 
 Real WallRawPotential(Real h)
@@ -448,6 +533,12 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.domain_height = ToReal(a, "--domain-height=");
         else if (StartsWith(a, "--fibre-half-width="))
             run_options.fibre_half_width = ToReal(a, "--fibre-half-width=");
+        else if (StartsWith(a, "--fibre-shape="))
+            run_options.fibre_shape = ToString(a, "--fibre-shape=");
+        else if (StartsWith(a, "--fibre-radius="))
+            run_options.fibre_radius = ToReal(a, "--fibre-radius=");
+        else if (StartsWith(a, "--fibre-length="))
+            run_options.fibre_length = ToReal(a, "--fibre-length=");
         else if (StartsWith(a, "--area-fraction="))
             run_options.area_fraction = ToReal(a, "--area-fraction=");
         else if (StartsWith(a, "--resolution="))
@@ -525,6 +616,18 @@ void ParseCommandLine(int argc, char *argv[])
         throw std::runtime_error("domain size must be positive.");
     if (2.0 * ExclusionRadius() >= run_options.domain_height)
         throw std::runtime_error("fibre does not fit inside the domain.");
+    if (run_options.fibre_shape != "strip" && run_options.fibre_shape != "cylinder" &&
+        run_options.fibre_shape != "none")
+        throw std::runtime_error("--fibre-shape must be strip, cylinder or none.");
+    if (run_options.fibre_shape == "cylinder")
+    {
+        if (run_options.fibre_radius <= 0.0 || run_options.fibre_length <= 0.0)
+            throw std::runtime_error("--fibre-radius and --fibre-length must be positive.");
+        // the fibre plus its periodic image must not overlap themselves
+        if (FibreLength() + 2.0 * ExclusionRadius() >= run_options.domain_length)
+            throw std::runtime_error(
+                "capsule fibre (length + 2*(radius+margin)) must be shorter than Lx.");
+    }
     if (run_options.area_fraction <= 0.0 || run_options.area_fraction >= 0.55)
         throw std::runtime_error("--area-fraction must be in (0,0.55).");
     if (run_options.initial_separation <= 0.0 ||
@@ -568,6 +671,19 @@ class FibreStripShape : public ComplexShape
   public:
     explicit FibreStripShape(const std::string &shape_name) : ComplexShape(shape_name)
     {
+        if (run_options.fibre_shape == "cylinder")
+        {
+            // capsule = straight segment of length fibre_length plus two caps
+            const Vecd axis_centre(0.5 * DomainLength(), FibreCentreY());
+            const Vecd half(0.5 * FibreLength(), FibreRadius());
+            add<GeometricShapeBox>(Transform(axis_centre), half);
+            const Real half_length = 0.5 * FibreLength();
+            add<GeometricShapeBall>(
+                Vecd(0.5 * DomainLength() - half_length, FibreCentreY()), FibreRadius());
+            add<GeometricShapeBall>(
+                Vecd(0.5 * DomainLength() + half_length, FibreCentreY()), FibreRadius());
+            return;
+        }
         const Vecd centre(0.5 * DomainLength(), FibreCentreY());
         const Vecd half(0.5 * DomainLength(), FibreHalfWidth());
         add<GeometricShapeBox>(Transform(centre), half);
@@ -598,8 +714,6 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
     {
         const Real lx = DomainLength();
         const Real ly = DomainHeight();
-        const Real centre_y = FibreCentreY();
-        const Real exclusion = ExclusionRadius();
         const Real min_separation = run_options.initial_separation;
         const int target = TargetParticleNumber();
 
@@ -654,7 +768,7 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
         {
             ++attempts;
             const Vecd candidate(uniform_x(rng), uniform_y(rng));
-            if (std::abs(candidate[1] - centre_y) < exclusion)
+            if (FibreContactOf(candidate).h < run_options.exclusion_margin)
                 continue;
             if (accepted_in_ring(candidate))
                 continue;
@@ -766,7 +880,6 @@ class CGConstraints : public LocalDynamics
 
         const Real lx = DomainLength();
         const Real ly = DomainHeight();
-        const Real centre_y = FibreCentreY();
         // With the Morse wall switched on its own h < r0 branch already
         // provides the near-wall repulsion, so the geometric constraint is
         // demoted to a numerical backstop placed far inside the well.
@@ -774,28 +887,27 @@ class CGConstraints : public LocalDynamics
         // the physical hard wall, placed at geometric contact r0 = 0.5 sigma
         // so that the excluded volume matches the Morse case.
         const bool morse_wall = run_options.wall_depth_d0 > 0.0;
-        const Real wall_limit =
-            FibreHalfWidth() + (morse_wall ? run_options.wall_guard_h
-                                           : run_options.wall_contact_h) * Sigma();
+        const Real wall_limit = (morse_wall ? run_options.wall_guard_h
+                                            : run_options.wall_contact_h) * Sigma();
         const size_t total = particles_->TotalRealParticles();
 
         for (size_t i = 0; i != total; ++i)
         {
-            Real offset = pos_[i][1] - centre_y;
-            if (std::abs(offset) < wall_limit)
+            const FibreContact contact = FibreContactOf(pos_[i]);
+            if (contact.h < wall_limit)
             {
                 if (morse_wall)
                     ++wall_guard_hits_;
                 else
                     ++wall_contact_hits_;
-                const Real sign = (offset >= 0.0) ? 1.0 : -1.0;
-                pos_[i][1] = centre_y + sign * wall_limit;
+                pos_[i] += contact.normal * (wall_limit - contact.h);
                 // Elastic (specular) bounce off the fibre core.  Reflecting the
                 // normal velocity keeps the constraint dissipation-free, so it
                 // does not act as a hidden energy sink that would bias the
                 // kinetic-temperature check.
-                if (vel_[i][1] * sign < 0.0)
-                    vel_[i][1] = -vel_[i][1];
+                const Real v_normal = vel_[i].dot(contact.normal);
+                if (v_normal < 0.0)
+                    vel_[i] -= 2.0 * v_normal * contact.normal;
             }
 
             if (run_options.y_reflect)
@@ -849,16 +961,13 @@ class CGWallForce : public LocalDynamics
     {
         if (run_options.wall_depth_d0 <= 0.0)
             return;
-        const Real centre_y = FibreCentreY();
         const size_t total = particles_->TotalRealParticles();
         for (size_t i = 0; i != total; ++i)
         {
-            const Real offset = pos_[i][1] - centre_y;
-            const Real h = std::abs(offset) - FibreHalfWidth();
-            if (h >= WallCutoff())
+            const FibreContact contact = FibreContactOf(pos_[i]);
+            if (contact.h >= WallCutoff())
                 continue;
-            const Real sign = (offset >= 0.0) ? 1.0 : -1.0;
-            force_[i][1] += sign * WallForce(h);
+            force_[i] += contact.normal * WallForce(contact.h);
         }
     }
 
@@ -1008,7 +1117,6 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
     auto *vel = real_body.getBaseParticles().getVariableDataByName<Vecd>("Velocity");
     d.particle_number = real_body.getBaseParticles().TotalRealParticles();
 
-    const Real centre_y = FibreCentreY();
     const int dimensions = 2;
     Real depth_sum = 0.0;
     Real v2_sum = 0.0;
@@ -1020,7 +1128,7 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
         v2_sum += v2;
         d.max_speed = std::max(d.max_speed, std::sqrt(v2));
         d.max_abs_vy = std::max(d.max_abs_vy, std::abs(vel[i][1]));
-        const Real h = std::abs(pos[i][1] - centre_y) - FibreHalfWidth();
+        const Real h = FibreContactOf(pos[i]).h;
         depth_sum += h;
         min_h = std::min(min_h, h);
         if (h < run_options.adsorption_cutoff_h * Sigma())
@@ -1104,8 +1212,11 @@ int main(int ac, char *av[])
               << " eps_wall_eff(k_BT)=" << wall_eps_eff_over_kBT
               << " alpha=" << WallAlpha() << " r0=" << WallRe()
               << " rc=" << WallCutoff() << " shifted_potential\n"
-              << "        h = |y - Ly/2| - a  (centre to fibre SURFACE;"
-                 " h=0.5 sigma is contact)\n"
+              << "        fibre shape=" << run_options.fibre_shape
+              << " radius=" << FibreRadius() << " length=" << FibreLength()
+              << " perimeter=" << FibrePerimeter() << "\n"
+              << "        h = centre to fibre SURFACE (h=0.5 sigma is contact;"
+                 " strip: h=|y-Ly/2|-a; cylinder: distance to the segment - R)\n"
               << "        guard_h=" << (run_options.wall_depth_d0 > 0.0
                                            ? run_options.wall_guard_h
                                            : run_options.wall_contact_h)
@@ -1209,7 +1320,9 @@ int main(int ac, char *av[])
         row("wall_shift_type", "shifted potential (energy shift only)",
             "E = E_raw(h) - E_raw(rc) for h < rc");
         row("wall_h_definition",
-            "h = |y - Ly/2| - fibre_half_width (centre to SURFACE)",
+            (run_options.fibre_shape == "cylinder")
+                ? "h = |r - nearest point of the axis segment| - fibre_radius (centre to SURFACE)"
+                : "h = |y - Ly/2| - fibre_half_width (centre to SURFACE)",
             "NOT centre to axis, and NOT a surface-to-surface gap");
         row("wall_guard_h", std::to_string(run_options.wall_guard_h),
             "numerical backstop; only meaningful when D0 > 0");
@@ -1242,6 +1355,16 @@ int main(int ac, char *av[])
         row("domain_length", std::to_string(DomainLength()), "periodic in x");
         row("domain_height", std::to_string(DomainHeight()), "reflecting in y");
         row("fibre_half_width", std::to_string(FibreHalfWidth()), "rigid, non-interacting");
+        row("fibre_shape", run_options.fibre_shape,
+            "strip = flat ribbon spanning the period (no curvature); cylinder = capsule");
+        row("fibre_radius", std::to_string(FibreRadius()),
+            "cap radius of the cylinder fibre (half-width for the strip)");
+        row("fibre_length", std::to_string(FibreLength()),
+            "straight-segment length of the cylinder fibre");
+        row("fibre_perimeter", std::to_string(FibrePerimeter()),
+            "2D circumference available for adsorption");
+        row("fibre_area", std::to_string(FibreArea()), "excluded area of the fibre");
+        row("free_area", std::to_string(FreeArea()), "domain area minus fibre area");
         row("particle_spacing", std::to_string(spacing), "2h = 2.6 dx >= pair cutoff");
         row("dt", std::to_string(dt), run_options.dt > 0.0 ? "user" : "automatic");
         row("dt_stability_limit", std::to_string(dt_limit),
