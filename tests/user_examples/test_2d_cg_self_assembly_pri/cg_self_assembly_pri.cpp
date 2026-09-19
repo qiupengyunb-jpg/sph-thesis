@@ -87,6 +87,17 @@ struct RunOptions
     std::string fibre_shape = "strip"; /**< strip | cylinder */
     Real fibre_radius = 5.0;           /**< cap radius of the cylinder fibre */
     Real fibre_length = 60.0;          /**< straight-segment length of it */
+    // Initial condition.  "scatter" is the original random RSA dispersion.
+    // "cluster" builds ONE pre-condensed aggregate on a triangular lattice so
+    // that the relaxation of a NON-circular free cluster can be measured
+    // (interface-tension test).  The lattice spacing is set by the requested
+    // packing; exactly --cluster-count sites closest to the shape centre are
+    // kept, so two different shapes hold exactly the same particle number.
+    std::string init_mode = "scatter";  /**< scatter | cluster */
+    std::string cluster_shape = "disc"; /**< disc | ellipse | rect */
+    Real cluster_aspect = 2.5;          /**< long/short axis ratio */
+    Real cluster_packing = 0.63;        /**< area fraction of the lattice */
+    int cluster_count = 800;            /**< particles in the cluster */
     Real area_fraction = 0.20;
     Real resolution = 2.0; /**< SPH lattice points per unit length */
 
@@ -539,6 +550,16 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.fibre_radius = ToReal(a, "--fibre-radius=");
         else if (StartsWith(a, "--fibre-length="))
             run_options.fibre_length = ToReal(a, "--fibre-length=");
+        else if (StartsWith(a, "--init="))
+            run_options.init_mode = ToString(a, "--init=");
+        else if (StartsWith(a, "--cluster-shape="))
+            run_options.cluster_shape = ToString(a, "--cluster-shape=");
+        else if (StartsWith(a, "--cluster-aspect="))
+            run_options.cluster_aspect = ToReal(a, "--cluster-aspect=");
+        else if (StartsWith(a, "--cluster-packing="))
+            run_options.cluster_packing = ToReal(a, "--cluster-packing=");
+        else if (StartsWith(a, "--cluster-count="))
+            run_options.cluster_count = ToInt(a, "--cluster-count=");
         else if (StartsWith(a, "--area-fraction="))
             run_options.area_fraction = ToReal(a, "--area-fraction=");
         else if (StartsWith(a, "--resolution="))
@@ -619,6 +640,22 @@ void ParseCommandLine(int argc, char *argv[])
     if (run_options.fibre_shape != "strip" && run_options.fibre_shape != "cylinder" &&
         run_options.fibre_shape != "none")
         throw std::runtime_error("--fibre-shape must be strip, cylinder or none.");
+    if (run_options.init_mode != "scatter" && run_options.init_mode != "cluster")
+        throw std::runtime_error("--init must be scatter or cluster.");
+    if (run_options.init_mode == "cluster")
+    {
+        if (run_options.cluster_count < 8)
+            throw std::runtime_error("--cluster-count must be at least 8.");
+        if (run_options.cluster_packing <= 0.05 || run_options.cluster_packing >= 0.72)
+            throw std::runtime_error(
+                "--cluster-packing must be in (0.05,0.72); 0.72 is the triangular "
+                "lattice limit set by the WCA contact distance.");
+        if (run_options.cluster_aspect < 1.0)
+            throw std::runtime_error("--cluster-aspect must be >= 1.");
+        if (run_options.cluster_shape != "disc" && run_options.cluster_shape != "ellipse" &&
+            run_options.cluster_shape != "rect")
+            throw std::runtime_error("--cluster-shape must be disc, ellipse or rect.");
+    }
     if (run_options.fibre_shape == "cylinder")
     {
         if (run_options.fibre_radius <= 0.0 || run_options.fibre_length <= 0.0)
@@ -715,6 +752,11 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
         const Real lx = DomainLength();
         const Real ly = DomainHeight();
         const Real min_separation = run_options.initial_separation;
+        if (run_options.init_mode == "cluster")
+        {
+            prepareCluster();
+            return;
+        }
         const int target = TargetParticleNumber();
 
         const Real bucket_size = std::max(min_separation, 1.0e-6);
@@ -791,6 +833,87 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
 
         for (const Vecd &position : accepted)
             addPositionAndVolumetricMeasure(position, 1.0);
+    }
+
+    /**
+     * One pre-condensed aggregate on a triangular lattice.  The lattice
+     * spacing follows from the requested packing fraction
+     *     phi = (pi sigma^2 / 4) / ((sqrt(3)/2) d^2),
+     * the shape fixes the target area A = N (pi sigma^2/4) / phi, and the N
+     * lattice sites with the smallest normalised shape coordinate are kept, so
+     * every shape holds EXACTLY the same particle number.
+     */
+    void prepareCluster()
+    {
+        const Real sigma = Sigma();
+        const Real phi = run_options.cluster_packing;
+        const Real n = static_cast<Real>(run_options.cluster_count);
+        const Real area = n * 0.25 * Pi * sigma * sigma / phi;
+        const Real d = sigma * std::sqrt((0.25 * Pi) / (0.5 * std::sqrt(3.0) * phi));
+
+        Real a = std::sqrt(area / Pi);           // disc radius
+        Real half_l = a, half_w = a;             // ellipse / rect half sizes
+        if (run_options.cluster_shape == "ellipse" ||
+            run_options.cluster_shape == "rect")
+        {
+            half_l = std::sqrt(area * run_options.cluster_aspect / Pi);
+            half_w = std::sqrt(area / (Pi * run_options.cluster_aspect));
+            if (run_options.cluster_shape == "rect")
+            {
+                half_l = 0.5 * std::sqrt(area * run_options.cluster_aspect);
+                half_w = 0.5 * std::sqrt(area / run_options.cluster_aspect);
+            }
+        }
+        if (2.0 * half_l >= DomainLength() - 2.0 * sigma ||
+            2.0 * half_w >= DomainHeight() - 2.0 * sigma)
+            throw std::runtime_error("cluster does not fit inside the domain.");
+
+        const Real row = 0.5 * std::sqrt(3.0) * d;
+        const int nx = static_cast<int>(std::ceil(half_l / d)) + 2;
+        const int ny = static_cast<int>(std::ceil(half_w / row)) + 2;
+        std::vector<std::pair<Real, Vecd>> sites;
+        for (int j = -ny; j <= ny; ++j)
+            for (int i = -nx; i <= nx; ++i)
+            {
+                const Vecd p(static_cast<Real>(i) * d +
+                                 ((j % 2) ? 0.5 * d : 0.0),
+                             static_cast<Real>(j) * row);
+                Real coord;
+                if (run_options.cluster_shape == "ellipse")
+                    coord = std::sqrt((p[0] / half_l) * (p[0] / half_l) +
+                                      (p[1] / half_w) * (p[1] / half_w));
+                else if (run_options.cluster_shape == "rect")
+                    coord = std::max(std::abs(p[0]) / half_l, std::abs(p[1]) / half_w);
+                else
+                    coord = p.norm() / half_l;
+                sites.emplace_back(coord, p);
+            }
+        std::sort(sites.begin(), sites.end(),
+                  [](const std::pair<Real, Vecd> &l, const std::pair<Real, Vecd> &r) {
+                      return l.first < r.first;
+                  });
+        if (static_cast<int>(sites.size()) < run_options.cluster_count)
+            throw std::runtime_error("not enough lattice sites for the cluster.");
+
+        Vecd sum(0.0, 0.0);
+        std::vector<Vecd> chosen;
+        chosen.reserve(static_cast<size_t>(run_options.cluster_count));
+        for (int k = 0; k < run_options.cluster_count; ++k)
+        {
+            chosen.push_back(sites[static_cast<size_t>(k)].second);
+            sum += sites[static_cast<size_t>(k)].second;
+        }
+        const Vecd shift(0.5 * DomainLength(), FibreCentreY());
+        const Vecd centre = sum / static_cast<Real>(run_options.cluster_count);
+        for (const Vecd &p : chosen)
+            addPositionAndVolumetricMeasure(p - centre + shift, 1.0);
+
+        std::cout << "  pre-condensed cluster: shape=" << run_options.cluster_shape
+                  << " aspect=" << run_options.cluster_aspect
+                  << " N=" << run_options.cluster_count
+                  << " packing=" << phi << " lattice_d=" << d
+                  << " area=" << area
+                  << " half_sizes=" << half_l << " x " << half_w << "\n";
     }
 };
 
@@ -1351,7 +1474,13 @@ int main(int ac, char *av[])
             "minimum sits at the WCA cut-off, not at r_e");
         row("area_fraction", std::to_string(run_options.area_fraction),
             "2D area fraction of discs of diameter sigma");
-        row("particle_number", std::to_string(target_number), "");
+        row("particle_number",
+            std::to_string(run_options.init_mode == "cluster"
+                               ? run_options.cluster_count
+                               : target_number),
+            run_options.init_mode == "cluster"
+                ? "actual number of particles in the pre-condensed cluster"
+                : "target number from the area fraction");
         row("domain_length", std::to_string(DomainLength()), "periodic in x");
         row("domain_height", std::to_string(DomainHeight()), "reflecting in y");
         row("fibre_half_width", std::to_string(FibreHalfWidth()), "rigid, non-interacting");
@@ -1365,6 +1494,16 @@ int main(int ac, char *av[])
             "2D circumference available for adsorption");
         row("fibre_area", std::to_string(FibreArea()), "excluded area of the fibre");
         row("free_area", std::to_string(FreeArea()), "domain area minus fibre area");
+        row("init_mode", run_options.init_mode,
+            "scatter = random RSA dispersion; cluster = one pre-condensed aggregate");
+        row("cluster_shape", run_options.cluster_shape,
+            "disc | ellipse | rect (only used when init_mode=cluster)");
+        row("cluster_aspect", std::to_string(run_options.cluster_aspect),
+            "long/short ratio of the initial cluster");
+        row("cluster_packing", std::to_string(run_options.cluster_packing),
+            "area fraction of the initial triangular lattice");
+        row("cluster_count", std::to_string(run_options.cluster_count),
+            "particles in the initial cluster");
         row("particle_spacing", std::to_string(spacing), "2h = 2.6 dx >= pair cutoff");
         row("dt", std::to_string(dt), run_options.dt > 0.0 ? "user" : "automatic");
         row("dt_stability_limit", std::to_string(dt_limit),
