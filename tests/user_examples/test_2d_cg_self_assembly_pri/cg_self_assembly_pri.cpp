@@ -1272,7 +1272,15 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
 //=============================================================================
 //  main
 //=============================================================================
-int main(int ac, char *av[])
+/**
+ * The whole case runs here.  Argument validation and the simulation body both
+ * report refusal and failure by throwing std::exception; main() below is a
+ * thin wrapper that turns those into a readable message and a defined exit
+ * status.  Before this split an escaped exception called std::terminate, which
+ * on MSVC aborts through __fastfail (exit 0xC0000409) and prints NOTHING --
+ * an invalid command line looked exactly like a crashed process.
+ */
+static int RunCgCase(int ac, char *av[])
 {
     ParseCommandLine(ac, av);
 
@@ -1635,4 +1643,24 @@ int main(int ac, char *av[])
               << " wall_seconds=" << wall_seconds << "\n";
     selfcheck.close();
     return 0;
+}
+
+int main(int ac, char *av[])
+{
+    try
+    {
+        return RunCgCase(ac, av);
+    }
+    catch (const std::exception &e)
+    {
+        // e.g. "--frames must be at least 2." -- say what was wrong instead
+        // of dying silently.
+        std::cerr << "error: " << e.what() << std::endl;
+        return 2;
+    }
+    catch (...)
+    {
+        std::cerr << "error: unrecognised exception" << std::endl;
+        return 2;
+    }
 }
