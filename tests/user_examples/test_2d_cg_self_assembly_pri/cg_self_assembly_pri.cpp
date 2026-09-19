@@ -93,7 +93,7 @@ struct RunOptions
     // (interface-tension test).  The lattice spacing is set by the requested
     // packing; exactly --cluster-count sites closest to the shape centre are
     // kept, so two different shapes hold exactly the same particle number.
-    std::string init_mode = "scatter";  /**< scatter | cluster */
+    std::string init_mode = "scatter";  /**< scatter | cluster | lattice */
     std::string cluster_shape = "disc"; /**< disc | ellipse | rect */
     Real cluster_aspect = 2.5;          /**< long/short axis ratio */
     Real cluster_packing = 0.63;        /**< area fraction of the lattice */
@@ -122,6 +122,15 @@ struct RunOptions
     Real wall_guard_h = 0.10;   /**< numerical backstop when D0 > 0 */
     Real wall_contact_h = 0.50; /**< hard-wall location used when D0 = 0 */
     Real adsorption_cutoff_h = 1.5; /**< h_ads for f_ads */
+
+    // ---- A-1 square-gradient interface free energy -------------------------
+    //  F_sg = (lambda/2) Sum_i V0 |grad rho_i|^2,   rho_i = Sum_j W_h(r_ij)
+    //  lambda = 0 is a TRUE zero path: both sweeps return before doing any
+    //  floating point work, so the trajectory is bit-identical to the
+    //  pre-A-1 baseline.  Nothing else in the physics is touched.
+    Real interface_lambda = 0.0;   /**< lambda in k_B T sigma^4; 0 disables */
+    Real interface_h = 2.0;        /**< kernel support h_rho / sigma */
+    Real interface_rho_ref = 0.88; /**< V0 = 1/rho_ref, the volume per particle */
 
     Real initial_separation = 1.0;
     Real exclusion_margin = 0.50;
@@ -506,9 +515,17 @@ void RegisterCGStateVariables(BaseParticles &particles)
     const Vecd zero = Vecd::Zero().eval();
     particles.registerStateVariableData<Vecd>("Velocity", zero);
     particles.registerStateVariableData<Vecd>("CG_Force", zero);
+    // A-1 square-gradient auxiliary fields (recomputed every step; registered
+    // as evolving so that a particle sort permutes them consistently).
+    particles.registerStateVariableData<Real>("CG_Rho", 1.0);
+    particles.registerStateVariableData<Vecd>("CG_RhoGrad", zero);
+    particles.registerStateVariableData<Vecd>("CG_SGForce", zero);
 
     particles.addEvolvingVariable<Vecd>("Velocity");
     particles.addEvolvingVariable<Vecd>("CG_Force");
+    particles.addEvolvingVariable<Real>("CG_Rho");
+    particles.addEvolvingVariable<Vecd>("CG_RhoGrad");
+    particles.addEvolvingVariable<Vecd>("CG_SGForce");
 
     particles.addVariableToWrite<Vecd>("Velocity");
     particles.addVariableToWrite<Vecd>("CG_Force");
@@ -560,6 +577,12 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.cluster_packing = ToReal(a, "--cluster-packing=");
         else if (StartsWith(a, "--cluster-count="))
             run_options.cluster_count = ToInt(a, "--cluster-count=");
+        else if (StartsWith(a, "--interface-gradient-lambda="))
+            run_options.interface_lambda = ToReal(a, "--interface-gradient-lambda=");
+        else if (StartsWith(a, "--interface-gradient-h="))
+            run_options.interface_h = ToReal(a, "--interface-gradient-h=");
+        else if (StartsWith(a, "--interface-gradient-rho-ref="))
+            run_options.interface_rho_ref = ToReal(a, "--interface-gradient-rho-ref=");
         else if (StartsWith(a, "--area-fraction="))
             run_options.area_fraction = ToReal(a, "--area-fraction=");
         else if (StartsWith(a, "--resolution="))
@@ -640,8 +663,9 @@ void ParseCommandLine(int argc, char *argv[])
     if (run_options.fibre_shape != "strip" && run_options.fibre_shape != "cylinder" &&
         run_options.fibre_shape != "none")
         throw std::runtime_error("--fibre-shape must be strip, cylinder or none.");
-    if (run_options.init_mode != "scatter" && run_options.init_mode != "cluster")
-        throw std::runtime_error("--init must be scatter or cluster.");
+    if (run_options.init_mode != "scatter" && run_options.init_mode != "cluster" &&
+        run_options.init_mode != "lattice")
+        throw std::runtime_error("--init must be scatter, cluster or lattice.");
     if (run_options.init_mode == "cluster")
     {
         if (run_options.cluster_count < 8)
@@ -674,6 +698,20 @@ void ParseCommandLine(int argc, char *argv[])
         throw std::runtime_error("--frames must be at least 2.");
     if (run_options.wall_depth_d0 < 0.0)
         throw std::runtime_error("--wall-depth-d0 must be non-negative.");
+    if (run_options.interface_lambda < 0.0)
+        throw std::runtime_error("--interface-gradient-lambda must be non-negative.");
+    if (run_options.interface_lambda > 0.0)
+    {
+        if (run_options.interface_h <= 0.0)
+            throw std::runtime_error("--interface-gradient-h must be positive.");
+        if (run_options.interface_rho_ref <= 0.0)
+            throw std::runtime_error("--interface-gradient-rho-ref must be positive.");
+        // the kernel support must fit inside the neighbour-list cut-off
+        if (run_options.interface_h > 0.99 * 2.6 * ParticleSpacing())
+            throw std::runtime_error(
+                "--interface-gradient-h exceeds the neighbour cut-off (2h = 2.6 dx); "
+                "the square-gradient kernel would be truncated silently.");
+    }
     if (run_options.wall_depth_d0 > 0.0)
     {
         if (run_options.wall_alpha <= 0.0)
@@ -755,6 +793,11 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
         if (run_options.init_mode == "cluster")
         {
             prepareCluster();
+            return;
+        }
+        if (run_options.init_mode == "lattice")
+        {
+            prepareUniformLattice();
             return;
         }
         const int target = TargetParticleNumber();
@@ -915,6 +958,36 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
                   << " area=" << area
                   << " half_sizes=" << half_l << " x " << half_w << "\n";
     }
+
+    /**
+     * Uniform triangular lattice filling the whole box, periodic in x.
+     * Used by the A-1 gate G1 (homogeneous bulk): with no surface at all the
+     * square-gradient term must produce no systematic force.
+     */
+    void prepareUniformLattice()
+    {
+        const Real sigma = Sigma();
+        const Real phi = run_options.cluster_packing;
+        const Real d0 = sigma * std::sqrt((0.25 * Pi) / (0.5 * std::sqrt(3.0) * phi));
+        const int nx = std::max(2, static_cast<int>(std::llround(DomainLength() / d0)));
+        const Real d = DomainLength() / static_cast<Real>(nx); // exact periodicity
+        const Real row = 0.5 * std::sqrt(3.0) * d;
+        const int ny = std::max(2, static_cast<int>(std::floor(DomainHeight() / row)));
+        const Real y0 = 0.5 * (DomainHeight() - (ny - 1) * row);
+        for (int j = 0; j < ny; ++j)
+            for (int i = 0; i < nx; ++i)
+            {
+                const Real x = (static_cast<Real>(i) + ((j % 2) ? 0.5 : 0.0)) * d;
+                const Real y = y0 + static_cast<Real>(j) * row;
+                addPositionAndVolumetricMeasure(Vecd(x, y), 1.0);
+            }
+        const Real packing = static_cast<Real>(nx * ny) * 0.25 * Pi * sigma * sigma /
+                             (DomainLength() * DomainHeight());
+        std::cout << "  uniform lattice: nx=" << nx << " ny=" << ny
+                  << " N=" << nx * ny << " d=" << d << " row=" << row
+                  << " packing=" << packing
+                  << " rho=" << packing / (0.25 * Pi * sigma * sigma) << "\n";
+    }
 };
 
 namespace
@@ -979,6 +1052,143 @@ class CGPairInteraction : public LocalDynamics, public DataDelegateInner
     Vecd *force_;
     Real min_separation_;
     std::atomic<size_t> periodic_pair_count_;
+};
+
+//=============================================================================
+//  A-1 square-gradient interface free energy
+//
+//  F_sg = (lambda/2) Sum_i V0 |grad rho_i|^2 ,   rho_i = Sum_j W_h(r_ij)
+//
+//  This is the direct particle discretisation of  (lambda/2) Int |grad rho|^2
+//  dA.  With G_i = grad rho_i = Sum_j W'(r_ij) e_ij and
+//  M_ij = W''(r_ij) e_ij (x) e_ij + (W'(r_ij)/r_ij)(I - e_ij (x) e_ij),
+//  the exact gradient of the discrete energy is
+//      F_a = -lambda V0 Sum_{k!=a} (G_a - G_k) . M_ak      ( = Sum_k f_ak )
+//  and f_ak = -f_ka identically, so total momentum is conserved exactly.
+//  No empirical "interface normal force" is used anywhere.
+//=============================================================================
+Real RhoSmoothingH() { return run_options.interface_h * Sigma(); }
+
+/** Wendland C2 kernel with support h_rho (normalised in 2D, C^2 at r = h). */
+inline Real RhoKernelW(Real r)
+{
+    const Real h = RhoSmoothingH();
+    const Real q = r / h;
+    if (q >= 1.0)
+        return 0.0;
+    const Real t = 1.0 - q;
+    return (7.0 / (Pi * h * h)) * t * t * t * t * (4.0 * q + 1.0);
+}
+
+/** dW/dr */
+inline Real RhoKernelDW(Real r)
+{
+    const Real h = RhoSmoothingH();
+    const Real q = r / h;
+    if (q >= 1.0)
+        return 0.0;
+    const Real t = 1.0 - q;
+    return -(140.0 / (Pi * h * h * h)) * q * t * t * t;
+}
+
+/** d2W/dr2 */
+inline Real RhoKernelDDW(Real r)
+{
+    const Real h = RhoSmoothingH();
+    const Real q = r / h;
+    if (q >= 1.0)
+        return 0.0;
+    const Real t = 1.0 - q;
+    return -(140.0 / (Pi * h * h * h * h)) * t * t * (1.0 - 4.0 * q);
+}
+
+/** Sweep 1: local density and its gradient.  True zero path at lambda = 0. */
+class CGSquareGradientDensity : public LocalDynamics, public DataDelegateInner
+{
+  public:
+    explicit CGSquareGradientDensity(BaseInnerRelation &inner_relation)
+        : LocalDynamics(inner_relation.getSPHBody()),
+          DataDelegateInner(inner_relation),
+          rho_(particles_->template getVariableDataByName<Real>("CG_Rho")),
+          grad_(particles_->template getVariableDataByName<Vecd>("CG_RhoGrad")) {}
+
+    void interaction(size_t index_i, Real dt = 0.0)
+    {
+        if (run_options.interface_lambda <= 0.0)
+            return;
+        Real rho = 0.0;
+        Vecd grad = Vecd::Zero();
+        const Neighborhood &neighborhood = inner_configuration_[index_i];
+        for (size_t n = 0; n != neighborhood.current_size_; ++n)
+        {
+            const Real r = neighborhood.r_ij_[n];
+            if (r <= TinyReal)
+                continue;
+            const Real w = RhoKernelW(r);
+            if (w <= 0.0)          // outside the kernel support
+                continue;
+            rho += w;
+            grad += RhoKernelDW(r) * neighborhood.e_ij_[n];
+        }
+        rho_[index_i] = rho;
+        grad_[index_i] = grad;
+    }
+
+    void update(size_t index_i, Real dt = 0.0) {}
+
+  private:
+    Real *rho_;
+    Vecd *grad_;
+};
+
+/** Sweep 2: the force that is the exact gradient of F_sg. */
+class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
+{
+  public:
+    explicit CGSquareGradientForce(BaseInnerRelation &inner_relation)
+        : LocalDynamics(inner_relation.getSPHBody()),
+          DataDelegateInner(inner_relation),
+          force_(particles_->template getVariableDataByName<Vecd>("CG_Force")),
+          sg_force_(particles_->template getVariableDataByName<Vecd>("CG_SGForce")),
+          grad_(particles_->template getVariableDataByName<Vecd>("CG_RhoGrad")) {}
+
+    void interaction(size_t index_i, Real dt = 0.0)
+    {
+        if (run_options.interface_lambda <= 0.0)
+        {
+            sg_force_[index_i] = Vecd::Zero();
+            return;
+        }
+        const Vecd g_i = grad_[index_i];
+        // f_ak = coeff * [ W'' (dG.e) e + (W'/r) (dG - (dG.e) e) ]
+        const Real coeff = -run_options.interface_lambda / run_options.interface_rho_ref;
+        Vecd f = Vecd::Zero();
+        const Neighborhood &neighborhood = inner_configuration_[index_i];
+        for (size_t n = 0; n != neighborhood.current_size_; ++n)
+        {
+            const size_t index_j = neighborhood.j_[n];
+            const Real r = neighborhood.r_ij_[n];
+            if (r <= TinyReal)
+                continue;
+            const Real w1 = RhoKernelDW(r);
+            if (w1 == 0.0)         // outside the support
+                continue;
+            const Vecd e = neighborhood.e_ij_[n];
+            const Vecd dG = g_i - grad_[index_j];
+            const Real dGe = dG.dot(e);
+            f += coeff * (RhoKernelDDW(r) * dGe * e +
+                          (w1 / r) * (dG - dGe * e));
+        }
+        sg_force_[index_i] = f;
+        force_[index_i] += f;
+    }
+
+    void update(size_t index_i, Real dt = 0.0) {}
+
+  private:
+    Vecd *force_;
+    Vecd *sg_force_;
+    Vecd *grad_;
 };
 
 //=============================================================================
@@ -1231,6 +1441,14 @@ struct FrameDiagnostics
     Real wall_min_h = 0.0; /**< smallest particle-surface distance, in sigma */
     size_t escaped = 0;
     Real max_abs_vy = 0.0;
+    // A-1 square-gradient diagnostics (all exactly zero when lambda = 0)
+    Real sg_rho_mean = 0.0;
+    Real sg_rho_min = 0.0;
+    Real sg_rho_max = 0.0;
+    Real sg_grad_max = 0.0;
+    Real sg_force_rms = 0.0;
+    Real sg_force_max = 0.0;
+    Real sg_net_force = 0.0;
 };
 
 FrameDiagnostics CollectDiagnostics(RealBody &real_body)
@@ -1245,6 +1463,12 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
     Real v2_sum = 0.0;
     Real min_h = std::numeric_limits<Real>::max();
     size_t bound = 0;
+    auto *rho = real_body.getBaseParticles().getVariableDataByName<Real>("CG_Rho");
+    auto *grad = real_body.getBaseParticles().getVariableDataByName<Vecd>("CG_RhoGrad");
+    auto *sgf = real_body.getBaseParticles().getVariableDataByName<Vecd>("CG_SGForce");
+    Real rho_sum = 0.0, rho_min = std::numeric_limits<Real>::max(), rho_max = 0.0;
+    Real f2_sum = 0.0;
+    Vecd f_net = Vecd::Zero();
     for (size_t i = 0; i != d.particle_number; ++i)
     {
         const Real v2 = vel[i].squaredNorm();
@@ -1258,6 +1482,17 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
             ++bound;
         if (pos[i][1] < -0.01 * DomainHeight() || pos[i][1] > 1.01 * DomainHeight())
             ++d.escaped;
+        if (run_options.interface_lambda > 0.0)
+        {
+            rho_sum += rho[i];
+            rho_min = std::min(rho_min, rho[i]);
+            rho_max = std::max(rho_max, rho[i]);
+            d.sg_grad_max = std::max(d.sg_grad_max, grad[i].norm());
+            const Real fn = sgf[i].norm();
+            f2_sum += fn * fn;
+            d.sg_force_max = std::max(d.sg_force_max, fn);
+            f_net += sgf[i];
+        }
     }
     const Real n = static_cast<Real>(d.particle_number);
     d.mean_height_above_fibre = depth_sum / n;
@@ -1265,6 +1500,14 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
     d.f_ads = static_cast<Real>(bound) / n;
     d.kinetic_temperature =
         v2_sum / (n * static_cast<Real>(dimensions) * run_options.temperature);
+    if (run_options.interface_lambda > 0.0)
+    {
+        d.sg_rho_mean = rho_sum / n;
+        d.sg_rho_min = (rho_min == std::numeric_limits<Real>::max()) ? 0.0 : rho_min;
+        d.sg_rho_max = rho_max;
+        d.sg_force_rms = std::sqrt(f2_sum / n);
+        d.sg_net_force = f_net.norm();
+    }
     return d;
 }
 } // namespace
@@ -1357,6 +1600,13 @@ static int RunCgCase(int ac, char *av[])
               << "  dt=" << dt << " (auto pair limit " << dt_auto
               << ", wall limit " << wall_dt_limit
               << ", chosen " << dt_auto_wall << ")\n";
+    if (run_options.interface_lambda > 0.0)
+        std::cout << "  A-1 square gradient: lambda=" << run_options.interface_lambda
+                  << " h_rho=" << RhoSmoothingH() << " rho_ref=" << run_options.interface_rho_ref
+                  << " V0=" << 1.0 / run_options.interface_rho_ref
+                  << "  (F_sg = (lambda/2) Sum_i V0 |grad rho_i|^2, Wendland C2 kernel)\n";
+    else
+        std::cout << "  A-1 square gradient: lambda=0 (disabled, true zero path)\n";
 
     //-------------------------------------------------------------------------
     //  Bodies
@@ -1376,6 +1626,8 @@ static int RunCgCase(int ac, char *av[])
     //  Dynamics
     //-------------------------------------------------------------------------
     InteractionWithUpdate<CGPairInteraction> pair_interaction(particles_inner);
+    InteractionWithUpdate<CGSquareGradientDensity> sg_density(particles_inner);
+    InteractionWithUpdate<CGSquareGradientForce> sg_force(particles_inner);
     CGWallForce wall_force(particles_body);
     CGInitialVelocity initial_velocity(particles_body);
     CGLangevinKick langevin_kick(particles_body);
@@ -1463,6 +1715,16 @@ static int RunCgCase(int ac, char *av[])
             "h_ads for f_ads");
         row("wall_dt_limit", std::to_string(wall_dt_limit),
             "2/omega from the wall stiffness at 1.5*guard_h");
+        row("interface_gradient_lambda", std::to_string(run_options.interface_lambda),
+            "A-1 square-gradient strength; 0 = disabled (true zero path)");
+        row("interface_gradient_h", std::to_string(run_options.interface_h),
+            "kernel support h_rho of the local density, in sigma");
+        row("interface_gradient_rho_ref", std::to_string(run_options.interface_rho_ref),
+            "V0 = 1/rho_ref, the constant volume per particle in F_sg");
+        row("interface_gradient_kernel", "Wendland C2, support h_rho",
+            "W = (7/(pi h^2))(1-q)^4(4q+1); dW/dr and d2W/dr2 analytic");
+        row("interface_gradient_force", "exact gradient of the discrete F_sg",
+            "f_ak = -lambda V0 [W''(dG.e)e + (W'/r)(dG-(dG.e)e)]; f_ak = -f_ka");
         row("morse_formula",
             "U_M(r) = D*[exp(-2*alpha*(r-r_e)) - 2*exp(-alpha*(r-r_e))]",
             "alpha is an INVERSE length; there is no length parameter 'a'");
@@ -1503,7 +1765,8 @@ static int RunCgCase(int ac, char *av[])
         row("fibre_area", std::to_string(FibreArea()), "excluded area of the fibre");
         row("free_area", std::to_string(FreeArea()), "domain area minus fibre area");
         row("init_mode", run_options.init_mode,
-            "scatter = random RSA dispersion; cluster = one pre-condensed aggregate");
+            "scatter = random RSA dispersion; cluster = one pre-condensed "
+            "aggregate; lattice = uniform periodic lattice (G1 bulk test)");
         row("cluster_shape", run_options.cluster_shape,
             "disc | ellipse | rect (only used when init_mode=cluster)");
         row("cluster_aspect", std::to_string(run_options.cluster_aspect),
@@ -1537,6 +1800,8 @@ static int RunCgCase(int ac, char *av[])
     pair_interaction.ResetCounters();
     pair_interaction.exec();
     wall_force.exec();
+    sg_density.exec();
+    sg_force.exec();
 
     std::ofstream selfcheck("selfcheck.csv");
     selfcheck << "time,particles,kinetic_temperature,D_over_kBT,eps_eff_over_kBT,"
@@ -1544,7 +1809,9 @@ static int RunCgCase(int ac, char *av[])
                  "max_speed,max_abs_vy,"
                  "min_neighbour_distance,mean_height_above_fibre,f_ads,wall_min_h,"
                  "wall_guard_hits,wall_contact_hits,"
-                 "wrapped_count,escaped_count,periodic_pairs,dt,steps\n";
+                 "wrapped_count,escaped_count,periodic_pairs,dt,steps,"
+                 "sg_rho_mean,sg_rho_min,sg_rho_max,sg_grad_max,"
+                 "sg_force_rms,sg_force_max,sg_net_force\n";
     selfcheck << std::setprecision(10);
 
     auto report = [&](Real time, Real dt_now, size_t steps, bool write_frame) {
@@ -1563,7 +1830,10 @@ static int RunCgCase(int ac, char *av[])
                   << constraints.WallContactHits()
                   << "," << constraints.WrapCount() << "," << d.escaped << ","
                   << pair_interaction.PeriodicPairCount() << "," << dt_now << ","
-                  << steps << "\n";
+                  << steps << ","
+                  << d.sg_rho_mean << "," << d.sg_rho_min << "," << d.sg_rho_max << ","
+                  << d.sg_grad_max << "," << d.sg_force_rms << ","
+                  << d.sg_force_max << "," << d.sg_net_force << "\n";
         selfcheck.flush();
         std::cout << std::fixed << std::setprecision(4)
                   << "T=" << time << " N=" << d.particle_number
@@ -1613,6 +1883,8 @@ static int RunCgCase(int ac, char *av[])
 
         pair_interaction.exec(dt_now);
         wall_force.exec(dt_now);
+        sg_density.exec(dt_now);
+        sg_force.exec(dt_now);
         langevin_kick.exec(dt_now);   // B/2 with F(x_new)
 
         physical_time += dt_now;
