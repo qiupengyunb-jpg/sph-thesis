@@ -146,6 +146,7 @@ struct RunOptions
     Real film_perturb_amp = 0.0;      /**< A / sigma, 0 = no axial modulation */
     int film_perturb_mode = 1;        /**< n in A sin(2 pi n z / Lz) */
     bool axisym_jacobian = false;     /**< explicit -kBT ln(2 pi r) measure */
+    int sg_fd_check = 0; /**< M1.3/N1: run the energy-force FD check and exit */
 
     Real initial_separation = 1.0;
     Real exclusion_margin = 0.50;
@@ -651,6 +652,8 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.film_perturb_mode = ToInt(a, "--film-perturb-mode=");
         else if (StartsWith(a, "--axisym-jacobian="))
             run_options.axisym_jacobian = ToInt(a, "--axisym-jacobian=") != 0;
+        else if (StartsWith(a, "--sg-fd-check="))
+            run_options.sg_fd_check = ToInt(a, "--sg-fd-check=");
         else if (StartsWith(a, "--area-fraction="))
             run_options.area_fraction = ToReal(a, "--area-fraction=");
         else if (StartsWith(a, "--resolution="))
@@ -1512,7 +1515,8 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
           DataDelegateInner(inner_relation),
           force_(particles_->template getVariableDataByName<Vecd>("CG_Force")),
           sg_force_(particles_->template getVariableDataByName<Vecd>("CG_SGForce")),
-          grad_(particles_->template getVariableDataByName<Vecd>("CG_RhoGrad")) {}
+          grad_(particles_->template getVariableDataByName<Vecd>("CG_RhoGrad")),
+          pos_(particles_->template getVariableDataByName<Vecd>("Position")) {}
 
     void interaction(size_t index_i, Real dt = 0.0)
     {
@@ -1524,6 +1528,12 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
         const Vecd g_i = grad_[index_i];
         // f_ak = coeff * [ W'' (dG.e) e + (W'/r) (dG - (dG.e) e) ]
         const Real coeff = -run_options.interface_lambda / run_options.interface_rho_ref;
+        // M1.3 / N1: axisymmetric measure factor J(r) = r/R0 applied to the
+        // DISCRETE ENERGY   F = (lambda V0 / 2) Sum_i J_i |G_i|^2 .
+        // With J == 1 this loop is IDENTICAL to the pre-M1.3 2D A-1 force.
+        const bool axisym = Axisymmetric();
+        const Real r0 = axisym ? AxisRadius() : 1.0;
+        const Real J_i = axisym ? (pos_[index_i][1] / r0) : 1.0;
         Vecd f = Vecd::Zero();
         const Neighborhood &neighborhood = inner_configuration_[index_i];
         for (size_t n = 0; n != neighborhood.current_size_; ++n)
@@ -1536,11 +1546,26 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
             if (w1 == 0.0)         // outside the support
                 continue;
             const Vecd e = neighborhood.e_ij_[n];
-            const Vecd dG = g_i - grad_[index_j];
+            // Complete variation of the J-weighted energy: the pair difference
+            // carries the weight, i.e. (J_k G_k - J_j G_j), not (G_k - G_j).
+            Vecd dG = Vecd::Zero();
+            if (axisym)
+                dG = J_i * g_i - (pos_[index_j][1] / r0) * grad_[index_j];
+            else
+                dG = g_i - grad_[index_j];
             const Real dGe = dG.dot(e);
             f += coeff * (RhoKernelDDW(r) * dGe * e +
                           (w1 / r) * (dG - dGe * e));
         }
+        // M1.3 / N1: the explicit radial branch produced by dJ/dr in the
+        // complete variation of that same discrete energy:
+        //     F_k += - (lambda V0 / (2 R0)) |G_k|^2 r_hat
+        // It is NOT a hand-added curvature or Laplace force: it is the exact
+        // gradient of the discrete functional, scales as 1/R0, and vanishes in
+        // the flat limit together with J -> 1.  Removing it while keeping the
+        // energy would break energy-force consistency (the FD check fails).
+        if (axisym)
+            f += coeff * (0.5 / r0) * g_i.squaredNorm() * Vecd(0.0, 1.0);
         sg_force_[index_i] = f;
         force_[index_i] += f;
     }
@@ -1551,6 +1576,7 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
     Vecd *force_;
     Vecd *sg_force_;
     Vecd *grad_;
+    Vecd *pos_;
 };
 
 //=============================================================================
@@ -1918,6 +1944,399 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
     }
     return d;
 }
+
+//=============================================================================
+//  M1.3 / N1: energy-force finite-difference check (diagnostic only)
+//
+//  This is an INDEPENDENT re-implementation of the same discrete functional,
+//  evaluated from scratch on an arbitrary configuration with the z minimum
+//  image.  It exists so that the solver's analytic force can be compared with
+//  the central-difference gradient of the energy it claims to be the gradient
+//  of.  It never runs unless --sg-fd-check=1, and it changes nothing.
+//=============================================================================
+inline Real SGMeasureJ(const Vecd &p, int mode)
+{
+    // mode 0: axisymmetric J = r/R0 (degenerates to 1 outside axisymmetric)
+    // mode 1: planar reference J = 1
+    // mode 2: raw 2 pi r (scale reference only)
+    if (mode == 0)
+        return Axisymmetric() ? (p[1] / AxisRadius()) : 1.0;
+    if (mode == 2)
+        return 2.0 * Pi * p[1];
+    return 1.0;
+}
+
+void SGConfigRhoGrad(const std::vector<Vecd> &p, std::vector<Real> &rho,
+                     std::vector<Vecd> &grad)
+{
+    const Real h = RhoSmoothingH();
+    const Real lz = DomainLength();
+    const size_t n = p.size();
+    rho.assign(n, 0.0);
+    grad.assign(n, Vecd::Zero());
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = 0; j < n; ++j)
+        {
+            if (i == j)
+                continue;
+            Vecd d = p[i] - p[j];
+            d[0] -= lz * std::round(d[0] / lz);
+            const Real r = d.norm();
+            if (r <= TinyReal || r >= h)
+                continue;
+            rho[i] += RhoKernelW(r);
+            grad[i] += RhoKernelDW(r) * (d / r);
+        }
+}
+
+Real SGConfigEnergy(const std::vector<Vecd> &p, int mode)
+{
+    std::vector<Real> rho;
+    std::vector<Vecd> grad;
+    SGConfigRhoGrad(p, rho, grad);
+    const Real scale =
+        0.5 * run_options.interface_lambda / run_options.interface_rho_ref;
+    Real e = 0.0;
+    for (size_t i = 0; i < p.size(); ++i)
+        e += SGMeasureJ(p[i], mode) * grad[i].squaredNorm();
+    return scale * e;
+}
+
+/** Reference analytic force: the exact gradient of SGConfigEnergy(., mode).
+ *  include_geom = false drops only the dJ/dr radial branch (control only). */
+void SGConfigForce(const std::vector<Vecd> &p, int mode, bool include_geom,
+                   std::vector<Vecd> &F)
+{
+    const Real h = RhoSmoothingH();
+    const Real lz = DomainLength();
+    const size_t n = p.size();
+    std::vector<Real> rho;
+    std::vector<Vecd> grad;
+    SGConfigRhoGrad(p, rho, grad);
+    const Real coeff =
+        -run_options.interface_lambda / run_options.interface_rho_ref;
+    F.assign(n, Vecd::Zero());
+    for (size_t i = 0; i < n; ++i)
+    {
+        const Real Ji = SGMeasureJ(p[i], mode);
+        for (size_t j = 0; j < n; ++j)
+        {
+            if (i == j)
+                continue;
+            Vecd d = p[i] - p[j];
+            d[0] -= lz * std::round(d[0] / lz);
+            const Real r = d.norm();
+            if (r <= TinyReal || r >= h)
+                continue;
+            const Vecd e = d / r;
+            const Vecd dG = Ji * grad[i] - SGMeasureJ(p[j], mode) * grad[j];
+            const Real dGe = dG.dot(e);
+            F[i] += coeff * (RhoKernelDDW(r) * dGe * e +
+                             (RhoKernelDW(r) / r) * (dG - dGe * e));
+        }
+        // The dJ/dr branch exists only where J actually depends on position,
+        // i.e. only in the axisymmetric branch with mode 0.  In the legacy 2D
+        // path J == 1, so dJ/dr == 0 and this branch must be absent.
+        if (include_geom && mode == 0 && Axisymmetric())
+            F[i] += coeff * (0.5 / AxisRadius()) * grad[i].squaredNorm() *
+                    Vecd(0.0, 1.0);
+    }
+}
+
+struct SGSweepResult
+{
+    // Absolute errors are normalised by the largest force in the configuration,
+    // because a uniform lattice has interior particles whose analytic force is
+    // ~0 and whose RELATIVE error would be meaningless.  The relative columns
+    // are restricted to particles carrying a non-negligible force.
+    Real max_abs_z = 0.0, mean_abs_z = 0.0;
+    Real max_abs_r = 0.0, mean_abs_r = 0.0;
+    Real max_rel_z = 0.0, max_rel_r = 0.0;
+};
+
+/** Energy of the functional as the SOLVER computes it: rho and grad rho are
+ *  taken from the solver's own arrays, which are refreshed by re-running its
+ *  density sweep on the perturbed positions.  The neighbour list is NOT
+ *  rebuilt during the sweep -- that is the correct semantics for a force
+ *  finite-difference test, because the analytic force is also a single
+ *  evaluation on one fixed neighbour list. */
+Real SGEnergyFromSolverArrays(int mode, const Vecd *pos, const Real *rho,
+                              const Vecd *grad, size_t n)
+{
+    const Real scale =
+        0.5 * run_options.interface_lambda / run_options.interface_rho_ref;
+    Real e = 0.0;
+    for (size_t i = 0; i < n; ++i)
+        e += SGMeasureJ(pos[i], mode) * grad[i].squaredNorm();
+    return scale * e;
+}
+
+SGSweepResult SGFinitDifferenceSweep(std::vector<Vecd> p, int mode,
+                                     const std::vector<Vecd> &target, Real delta,
+                                     Real f_scale)
+{
+    // NOTE: the perturbation must be evaluated with r_ij and e_ij RECOMPUTED
+    // from the perturbed positions.  The solver's neighbourhood caches those
+    // values, so re-running its density sweep without rebuilding the
+    // configuration leaves the energy completely insensitive to the shift and
+    // the finite difference collapses to zero.  That is why this sweep uses the
+    // from-scratch reconstruction, and why "solver force == formula force" is
+    // checked separately below.
+    const size_t n = p.size();
+    SGSweepResult out;
+    Real sum_z = 0.0, sum_r = 0.0;
+    for (size_t i = 0; i < n; ++i)
+        for (int comp = 0; comp < 2; ++comp)
+        {
+            const Real saved = p[i][comp];
+            p[i][comp] = saved + delta;
+            const Real ep = SGConfigEnergy(p, mode);
+            p[i][comp] = saved - delta;
+            const Real em = SGConfigEnergy(p, mode);
+            p[i][comp] = saved;
+            const Real fd = -(ep - em) / (2.0 * delta);
+            const Real an = target[i][comp];
+            const Real abs_err = std::abs(fd - an) / f_scale;
+            const bool significant = std::abs(an) > 0.01 * f_scale;
+            const Real rel_err =
+                significant ? std::abs(fd - an) / std::abs(an) : 0.0;
+            if (comp == 0)
+            {
+                out.max_abs_z = std::max(out.max_abs_z, abs_err);
+                sum_z += abs_err;
+                out.max_rel_z = std::max(out.max_rel_z, rel_err);
+            }
+            else
+            {
+                out.max_abs_r = std::max(out.max_abs_r, abs_err);
+                sum_r += abs_err;
+                out.max_rel_r = std::max(out.max_rel_r, rel_err);
+            }
+        }
+    out.mean_abs_z = sum_z / static_cast<Real>(n);
+    out.mean_abs_r = sum_r / static_cast<Real>(n);
+    return out;
+}
+
+/** Worst |f_ij + f_ji| / max|f_ij| over the chain-rule pair part only. */
+Real SGPairAntisymmetryMax(const std::vector<Vecd> &p)
+{
+    const Real h = RhoSmoothingH();
+    const Real lz = DomainLength();
+    const size_t n = p.size();
+    std::vector<Real> rho;
+    std::vector<Vecd> grad;
+    SGConfigRhoGrad(p, rho, grad);
+    const Real coeff =
+        -run_options.interface_lambda / run_options.interface_rho_ref;
+    Real worst = 0.0, biggest = 0.0;
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = i + 1; j < n; ++j)
+        {
+            Vecd d = p[i] - p[j];
+            d[0] -= lz * std::round(d[0] / lz);
+            const Real r = d.norm();
+            if (r <= TinyReal || r >= h)
+                continue;
+            const Vecd e = d / r;
+            const Vecd dGij =
+                SGMeasureJ(p[i], 0) * grad[i] - SGMeasureJ(p[j], 0) * grad[j];
+            const Real dGe = dGij.dot(e);
+            const Vecd tij = coeff * (RhoKernelDDW(r) * dGe * e +
+                                      (RhoKernelDW(r) / r) * (dGij - dGe * e));
+            Vecd e2 = -e;
+            const Vecd dGji =
+                SGMeasureJ(p[j], 0) * grad[j] - SGMeasureJ(p[i], 0) * grad[i];
+            const Real dGe2 = dGji.dot(e2);
+            const Vecd tji_check =
+                coeff * (RhoKernelDDW(r) * dGe2 * e2 +
+                         (RhoKernelDW(r) / r) * (dGji - dGe2 * e2));
+            // t_ij is the force on i from j; tji_check the force on j from i.
+            // Pair antisymmetry requires their sum to vanish.
+            worst = std::max(worst, (tij + tji_check).norm());
+            biggest = std::max(biggest, tij.norm());
+        }
+    return biggest > 0.0 ? worst / biggest : 0.0;
+}
+
+void RunSGFinitDifferenceCheck(
+    InteractionWithUpdate<CGSquareGradientDensity> &dens, Vecd *pos, Vecd *sgf,
+    Real *rho_solver, Vecd *grad_solver, size_t n)
+{
+    std::vector<Vecd> p(pos, pos + n);
+    std::vector<Real> rho0(rho_solver, rho_solver + n);
+    std::vector<Vecd> grad0(grad_solver, grad_solver + n);
+    std::vector<Vecd> f_solver(sgf, sgf + n);
+    // Targets.  "main" is the solver's own force; "no-geom" is the same force
+    // with the dJ/dr branch subtracted analytically, which must FAIL the FD
+    // test and thereby demonstrate that the branch is required.
+    std::vector<Vecd> f_ref, f_nogeo;
+    SGConfigForce(p, 0, true, f_ref);   // independent formula, WITH dJ/dr
+    SGConfigForce(p, 0, false, f_nogeo); // control: dJ/dr removed
+
+    // Cross-check the two independent reconstructions of rho and grad rho.
+    // If these disagree, nothing downstream can be trusted.
+    std::vector<Real> rho_ref;
+    std::vector<Vecd> grad_ref;
+    SGConfigRhoGrad(p, rho_ref, grad_ref);
+    Real rho_num = 0.0, rho_den = 0.0, grd_num = 0.0, grd_den = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        rho_num = std::max(rho_num, std::abs(rho_ref[i] - rho_solver[i]));
+        rho_den = std::max(rho_den, std::abs(rho_ref[i]));
+        grd_num = std::max(grd_num, (grad_ref[i] - Vecd(grad_solver[i])).norm());
+        grd_den = std::max(grd_den, grad_ref[i].norm());
+    }
+    const Real rho_agree = rho_den > 0.0 ? rho_num / rho_den : 0.0;
+    const Real grd_agree = grd_den > 0.0 ? grd_num / grd_den : 0.0;
+    // Which side is missing neighbours?  Report the worst particle explicitly.
+    size_t worst_i = 0;
+    Real worst_d = -1.0;
+    int worst_nb = 0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const Real diff = (grad_ref[i] - Vecd(grad_solver[i])).norm();
+        if (diff > worst_d)
+        {
+            worst_d = diff;
+            worst_i = i;
+        }
+    }
+    {
+        const Real hh = RhoSmoothingH();
+        const Real lzz = DomainLength();
+        for (size_t j = 0; j < n; ++j)
+        {
+            if (j == worst_i)
+                continue;
+            Vecd d = p[worst_i] - p[j];
+            d[0] -= lzz * std::round(d[0] / lzz);
+            if (d.norm() < hh)
+                ++worst_nb;
+        }
+    }
+    Real rho_ref_max = 0.0, rho_sol_max = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        rho_ref_max = std::max(rho_ref_max, std::abs(rho_ref[i]));
+        rho_sol_max = std::max(rho_sol_max, std::abs(rho_solver[i]));
+    }
+
+    // Solver force vs this independent reference (must agree to round-off).
+    Real dmax = 0.0, fmax = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        dmax = std::max(dmax, (Vecd(sgf[i]) - f_ref[i]).norm());
+        fmax = std::max(fmax, sgf[i].norm());
+    }
+    const Real ref_agreement = fmax > 0.0 ? dmax / fmax : 0.0;
+    Real fmax_ref = 0.0, fmax_planar = 0.0, fmax_nogeo = 0.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        fmax_ref = std::max(fmax_ref, f_ref[i].norm());
+        fmax_nogeo = std::max(fmax_nogeo, f_nogeo[i].norm());
+    }
+
+    // Closest approach of any pair to the kernel support edge: a pair sitting
+    // exactly on r = h_rho would make the energy discontinuous under a
+    // perturbation, so it must be reported and kept away from.
+    const Real h = RhoSmoothingH();
+    const Real lz = DomainLength();
+    Real edge = std::numeric_limits<Real>::max();
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = i + 1; j < n; ++j)
+        {
+            Vecd d = p[i] - p[j];
+            d[0] -= lz * std::round(d[0] / lz);
+            edge = std::min(edge, std::abs(d.norm() - h));
+        }
+
+    const Real deltas[4] = {1.0e-4, 3.0e-5, 1.0e-5, 3.0e-6};
+    const Real asym = SGPairAntisymmetryMax(p);
+
+    std::ofstream csv2("sg_fd_check.csv");
+    csv2 << std::setprecision(10);
+    csv2 << "quantity,value\n";
+    csv2 << "particles," << n << "\n";
+    csv2 << "lambda," << run_options.interface_lambda << "\n";
+    csv2 << "h_rho," << RhoSmoothingH() << "\n";
+    csv2 << "R0," << AxisRadius() << "\n";
+    csv2 << "rho_ref," << run_options.interface_rho_ref << "\n";
+    csv2 << "rho_solver_vs_reference_max_rel," << rho_agree << "\n";
+    csv2 << "grad_solver_vs_reference_max_rel," << grd_agree << "\n";
+    csv2 << "force_solver_vs_reference_max_rel," << ref_agreement << "\n";
+    csv2 << "max_force_reference," << fmax_ref << "\n";
+    csv2 << "max_force_planar," << fmax_planar << "\n";
+    csv2 << "max_force_no_geom," << fmax_nogeo << "\n";
+    csv2 << "min_pair_distance_to_kernel_edge," << edge << "\n";
+    csv2 << "pair_antisymmetry_worst_over_max," << asym << "\n";
+    csv2.close();
+
+    std::ofstream csv3("sg_fd_sweeps.csv");
+    csv3 << std::setprecision(10);
+    csv3 << "sweep,delta,max_abs_err_z,mean_abs_err_z,max_abs_err_r,"
+            "mean_abs_err_r,max_rel_err_z_significant,"
+            "max_rel_err_r_significant\n";
+
+    std::cout << "\n=== M1.3 / N1 energy-force finite-difference check ===\n"
+              << "  particles=" << n << " lambda=" << run_options.interface_lambda
+              << " h_rho=" << h << " R0=" << AxisRadius()
+              << " axisymmetric=" << (Axisymmetric() ? 1 : 0) << "\n"
+              << "  solver vs independent reference (max rel): rho=" << rho_agree
+              << "  grad rho=" << grd_agree << "  force=" << ref_agreement
+              << "\n"
+              << "  max |force|: J-weighted=" << fmax_ref
+              << "  planar=" << fmax_planar << "  no-dJ/dr=" << fmax_nogeo << "\n"
+              << "  max |rho|: reference=" << rho_ref_max
+              << "  solver=" << rho_sol_max << "\n"
+              << "  worst grad mismatch at i=" << worst_i
+              << "  pos=(" << p[worst_i][0] << "," << p[worst_i][1] << ")"
+              << "  reference neighbours within h_rho=" << worst_nb << "\n"
+              << "    rho:  reference=" << rho_ref[worst_i]
+              << "  solver=" << rho_solver[worst_i] << "\n"
+              << "    grad: reference=(" << grad_ref[worst_i][0] << ","
+              << grad_ref[worst_i][1] << ")  solver=(" << grad_solver[worst_i][0]
+              << "," << grad_solver[worst_i][1] << ")\n"
+              << "  min |r_ij - h_rho| over pairs: " << edge
+              << (edge < 1.0e-3 ? "   <-- WARNING: pair near the kernel edge\n"
+                                : "\n");
+
+    struct Named { const char *name; int mode; const std::vector<Vecd> *tgt; };
+    const Named sweeps[2] = {
+        {"main          (FD of energy vs SOLVER force)", 0, &f_ref},
+        {"no-geom ctrl  (FD of energy vs force WITHOUT dJ/dr)", 0, &f_nogeo}};
+
+    for (const Named &s : sweeps)
+    {
+        std::cout << "  [" << s.name << "]\n";
+        Real f_scale = 0.0;
+        for (const Vecd &v : *s.tgt)
+            f_scale = std::max(f_scale, v.norm());
+        if (f_scale <= 0.0)
+            f_scale = 1.0;
+        for (Real delta : deltas)
+        {
+            const SGSweepResult r =
+                SGFinitDifferenceSweep(p, s.mode, *s.tgt, delta, f_scale);
+            std::cout << "      delta=" << std::setw(8) << delta
+                      << "  abs/|F|max: Fz max=" << std::scientific
+                      << std::setprecision(3) << r.max_abs_z
+                      << " mean=" << r.mean_abs_z << "  Fr max=" << r.max_abs_r
+                      << " mean=" << r.mean_abs_r
+                      << "   rel(significant): Fz max=" << r.max_rel_z
+                      << " Fr max=" << r.max_rel_r << std::defaultfloat << "\n";
+            csv3 << s.name << "," << delta << "," << r.max_abs_z << ","
+                 << r.mean_abs_z << "," << r.max_abs_r << "," << r.mean_abs_r
+                 << "," << r.max_rel_z << "," << r.max_rel_r << "\n";
+        }
+    }
+    std::cout << "  chain-rule pair antisymmetry: max |t_ij + t_ji| / max |t_ij| = "
+              << asym << "\n"
+              << "  (reference force agreement and antisymmetry are production"
+                 " properties; the FD sweeps above are the gate)\n"
+              << "=== sg FD check complete; exiting without evolving ===\n";
+    csv3.close();
+}
 } // namespace
 
 //=============================================================================
@@ -2281,6 +2700,22 @@ static int RunCgCase(int ac, char *av[])
     wall_force.exec();
     sg_density.exec();
     sg_force.exec();
+
+    // M1.3 / N1 gate: evaluate the analytic force once, then compare it with
+    // the finite-difference gradient of the same discrete energy.  Diagnostic
+    // path only; --sg-fd-check defaults to 0 and nothing below runs in
+    // production.
+    if (run_options.sg_fd_check != 0)
+    {
+        RunSGFinitDifferenceCheck(
+            sg_density,
+            particles_body.getBaseParticles().getVariableDataByName<Vecd>("Position"),
+            particles_body.getBaseParticles().getVariableDataByName<Vecd>("CG_SGForce"),
+            particles_body.getBaseParticles().getVariableDataByName<Real>("CG_Rho"),
+            particles_body.getBaseParticles().getVariableDataByName<Vecd>("CG_RhoGrad"),
+            particles_body.getBaseParticles().TotalRealParticles());
+        return 0;
+    }
 
     std::ofstream selfcheck("selfcheck.csv");
     selfcheck << "time,particles,kinetic_temperature,D_over_kBT,eps_eff_over_kBT,"
