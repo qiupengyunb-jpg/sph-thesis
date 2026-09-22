@@ -2229,7 +2229,46 @@ void RunSGFinitDifferenceCheck(
         dmax = std::max(dmax, (Vecd(sgf[i]) - f_ref[i]).norm());
         fmax = std::max(fmax, sgf[i].norm());
     }
+    // Round-off yardstick: the sum of ABSOLUTE pair contributions per particle.
+    // The pair sum in grad rho and in the force involves large cancellations, so
+    // the meaningful question is whether the residual sits at the floating-point
+    // level of the terms being summed, not whether it is small relative to the
+    // (possibly near-zero) result.
+    Real roundoff_scale = 0.0;
+    {
+        const Real hh = RhoSmoothingH();
+        const Real lzz = DomainLength();
+        const Real coeff =
+            -run_options.interface_lambda / run_options.interface_rho_ref;
+        std::vector<Real> rho_t;
+        std::vector<Vecd> grad_t;
+        SGConfigRhoGrad(p, rho_t, grad_t);
+        for (size_t i = 0; i < n; ++i)
+        {
+            Real acc = 0.0;
+            for (size_t j = 0; j < n; ++j)
+            {
+                if (i == j)
+                    continue;
+                Vecd d = p[i] - p[j];
+                d[0] -= lzz * std::round(d[0] / lzz);
+                const Real r = d.norm();
+                if (r <= TinyReal || r >= hh)
+                    continue;
+                const Vecd e = d / r;
+                const Vecd dGj = SGMeasureJ(p[i], 0) * grad_t[i] -
+                                 SGMeasureJ(p[j], 0) * grad_t[j];
+                const Real dGe = dGj.dot(e);
+                acc += std::abs(coeff) * (std::abs(RhoKernelDDW(r) * dGe) +
+                                          std::abs(RhoKernelDW(r) / r) *
+                                              (dGj - dGe * e).norm());
+            }
+            roundoff_scale = std::max(roundoff_scale, acc);
+        }
+    }
     const Real ref_agreement = fmax > 0.0 ? dmax / fmax : 0.0;
+    const Real ref_roundoff =
+        roundoff_scale > 0.0 ? dmax / roundoff_scale : 0.0;
     Real fmax_ref = 0.0, fmax_planar = 0.0, fmax_nogeo = 0.0;
     for (size_t i = 0; i < n; ++i)
     {
@@ -2265,12 +2304,47 @@ void RunSGFinitDifferenceCheck(
     csv2 << "rho_solver_vs_reference_max_rel," << rho_agree << "\n";
     csv2 << "grad_solver_vs_reference_max_rel," << grd_agree << "\n";
     csv2 << "force_solver_vs_reference_max_rel," << ref_agreement << "\n";
+    csv2 << "force_residual_over_sum_of_absolute_terms," << ref_roundoff << "\n";
+    csv2 << "force_residual_abs," << dmax << "\n";
+    csv2 << "sum_of_absolute_pair_terms_max," << roundoff_scale << "\n";
     csv2 << "max_force_reference," << fmax_ref << "\n";
     csv2 << "max_force_planar," << fmax_planar << "\n";
     csv2 << "max_force_no_geom," << fmax_nogeo << "\n";
     csv2 << "min_pair_distance_to_kernel_edge," << edge << "\n";
     csv2 << "pair_antisymmetry_worst_over_max," << asym << "\n";
     csv2.close();
+
+    {
+        // Per-particle dump so that any solver-vs-formula residual can be
+        // attributed to specific particles instead of being averaged away.
+        std::ofstream pc("sg_fd_particles.csv");
+        pc << std::setprecision(17);
+        pc << "i,z,r,rho_ref,rho_solver,grad_ref_z,grad_ref_r,grad_solver_z,"
+              "grad_solver_r,nbr_ref,rho_diff,grad_diff,f_solver_r,f_ref_r\n";
+        const Real hh = RhoSmoothingH();
+        const Real lzz = DomainLength();
+        for (size_t i = 0; i < n; ++i)
+        {
+            int nb = 0;
+            for (size_t j = 0; j < n; ++j)
+            {
+                if (i == j)
+                    continue;
+                Vecd d = p[i] - p[j];
+                d[0] -= lzz * std::round(d[0] / lzz);
+                if (d.norm() < hh)
+                    ++nb;
+            }
+            pc << i << "," << p[i][0] << "," << p[i][1] << "," << rho_ref[i]
+               << "," << rho_solver[i] << "," << grad_ref[i][0] << ","
+               << grad_ref[i][1] << "," << grad_solver[i][0] << ","
+               << grad_solver[i][1] << "," << nb << ","
+               << (rho_ref[i] - rho_solver[i]) << ","
+               << (grad_ref[i] - Vecd(grad_solver[i])).norm() << ","
+               << f_solver[i][1] << "," << f_ref[i][1] << "\n";
+        }
+        pc.close();
+    }
 
     std::ofstream csv3("sg_fd_sweeps.csv");
     csv3 << std::setprecision(10);
@@ -2285,6 +2359,9 @@ void RunSGFinitDifferenceCheck(
               << "  solver vs independent reference (max rel): rho=" << rho_agree
               << "  grad rho=" << grd_agree << "  force=" << ref_agreement
               << "\n"
+              << "  force residual: abs=" << dmax
+              << "  / sum|terms|=" << roundoff_scale
+              << "  => round-off normalised=" << ref_roundoff << "\n"
               << "  max |force|: J-weighted=" << fmax_ref
               << "  planar=" << fmax_planar << "  no-dJ/dr=" << fmax_nogeo << "\n"
               << "  max |rho|: reference=" << rho_ref_max
