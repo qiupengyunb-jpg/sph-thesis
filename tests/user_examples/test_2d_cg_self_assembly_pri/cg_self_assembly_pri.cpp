@@ -1572,6 +1572,60 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
 
     void update(size_t index_i, Real dt = 0.0) {}
 
+    /**
+     * M1.3 / N2.2 REF-CACHED.  Recompute the force through a SEPARATE code path
+     * from the SAME cached neighbour geometry (r_ij, e_ij) that the production
+     * sweep uses, and return the unified error
+     *     E_force = max_i |F_recomputed_i - sg_force_i| / max_i |sg_force_i|
+     * This verifies that the production force is exactly the formula applied to
+     * the cached geometry.  A REF-RECOMPUTED reference (distances taken from the
+     * particle positions instead) is a different object and is NOT required to
+     * agree with this to 1e-12.
+     */
+    Real CachedReferenceMaxRelativeError() const
+    {
+        const size_t total = particles_->TotalRealParticles();
+        const bool axisym = Axisymmetric();
+        const Real r0 = axisym ? AxisRadius() : 1.0;
+        const Real coeff =
+            -run_options.interface_lambda / run_options.interface_rho_ref;
+        Real dmax = 0.0, fmax = 0.0;
+        for (size_t i = 0; i != total; ++i)
+        {
+            Vecd f = Vecd::Zero();
+            if (run_options.interface_lambda > 0.0)
+            {
+                const Real Ji = axisym ? (pos_[i][1] / r0) : 1.0;
+                const Neighborhood &nb = inner_configuration_[i];
+                for (size_t n = 0; n != nb.current_size_; ++n)
+                {
+                    const Real r = nb.r_ij_[n];
+                    if (r <= TinyReal)
+                        continue;
+                    const Real w1 = RhoKernelDW(r);
+                    if (w1 == 0.0)
+                        continue;
+                    const Vecd e = nb.e_ij_[n];
+                    Vecd dG = Vecd::Zero();
+                    if (axisym)
+                        dG = Ji * grad_[i] -
+                             (pos_[nb.j_[n]][1] / r0) * grad_[nb.j_[n]];
+                    else
+                        dG = grad_[i] - grad_[nb.j_[n]];
+                    const Real dGe = dG.dot(e);
+                    f += coeff * (RhoKernelDDW(r) * dGe * e +
+                                  (w1 / r) * (dG - dGe * e));
+                }
+                if (axisym)
+                    f += coeff * (0.5 / r0) * grad_[i].squaredNorm() *
+                         Vecd(0.0, 1.0);
+            }
+            dmax = std::max(dmax, (f - Vecd(sg_force_[i])).norm());
+            fmax = std::max(fmax, sg_force_[i].norm());
+        }
+        return fmax > 0.0 ? dmax / fmax : 0.0;
+    }
+
   private:
     Vecd *force_;
     Vecd *sg_force_;
@@ -2161,7 +2215,7 @@ Real SGPairAntisymmetryMax(const std::vector<Vecd> &p)
 
 void RunSGFinitDifferenceCheck(
     InteractionWithUpdate<CGSquareGradientDensity> &dens, Vecd *pos, Vecd *sgf,
-    Real *rho_solver, Vecd *grad_solver, size_t n)
+    Real *rho_solver, Vecd *grad_solver, size_t n, Real e_force_cached)
 {
     std::vector<Vecd> p(pos, pos + n);
     std::vector<Real> rho0(rho_solver, rho_solver + n);
@@ -2304,6 +2358,7 @@ void RunSGFinitDifferenceCheck(
     csv2 << "rho_solver_vs_reference_max_rel," << rho_agree << "\n";
     csv2 << "grad_solver_vs_reference_max_rel," << grd_agree << "\n";
     csv2 << "force_solver_vs_reference_max_rel," << ref_agreement << "\n";
+    csv2 << "E_force_solver_vs_REF_CACHED," << e_force_cached << "\n";
     csv2 << "force_residual_over_sum_of_absolute_terms," << ref_roundoff << "\n";
     csv2 << "force_residual_abs," << dmax << "\n";
     csv2 << "sum_of_absolute_pair_terms_max," << roundoff_scale << "\n";
@@ -2362,6 +2417,8 @@ void RunSGFinitDifferenceCheck(
               << "  force residual: abs=" << dmax
               << "  / sum|terms|=" << roundoff_scale
               << "  => round-off normalised=" << ref_roundoff << "\n"
+              << "  E_force (solver vs REF-CACHED, unified definition) = "
+              << e_force_cached << "\n"
               << "  max |force|: J-weighted=" << fmax_ref
               << "  planar=" << fmax_planar << "  no-dJ/dr=" << fmax_nogeo << "\n"
               << "  max |rho|: reference=" << rho_ref_max
@@ -2790,7 +2847,8 @@ static int RunCgCase(int ac, char *av[])
             particles_body.getBaseParticles().getVariableDataByName<Vecd>("CG_SGForce"),
             particles_body.getBaseParticles().getVariableDataByName<Real>("CG_Rho"),
             particles_body.getBaseParticles().getVariableDataByName<Vecd>("CG_RhoGrad"),
-            particles_body.getBaseParticles().TotalRealParticles());
+            particles_body.getBaseParticles().TotalRealParticles(),
+            sg_force.CachedReferenceMaxRelativeError());
         return 0;
     }
 
