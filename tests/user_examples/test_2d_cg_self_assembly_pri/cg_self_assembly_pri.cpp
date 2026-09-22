@@ -152,6 +152,13 @@ struct RunOptions
     int sg_force_dump = 0;    /**< dump per-particle term(1)/term(2) force split */
     bool noise_off = false;   /**< T = 0 diagnostic: zero the OU noise amplitude */
     bool axisym_j_one = false;/**< force J = 1 in the (z,r) branch (J control) */
+    // ---- M1.3R experimental interface-energy schemes (default = production) --
+    //  moving_j        : Scheme A, (lambda V0 / 2) Sum_i J_i |G_i|^2   (frozen)
+    //  difference_energy: Scheme E, (lambda/2) V0^2 Sum_{i<j} J_ij Kt_ij
+    //                     (rho_i - rho_j)^2, Kt = c W, c = 144/(5 h^2)
+    //  Scheme E is available only in the axisymmetric branch and is OFF by
+    //  default, so every historical trajectory stays bit-identical.
+    std::string axisym_interface_scheme = "moving_j";
 
     Real initial_separation = 1.0;
     Real exclusion_margin = 0.50;
@@ -582,12 +589,15 @@ void RegisterCGStateVariables(BaseParticles &particles)
     particles.registerStateVariableData<Real>("CG_Rho", 1.0);
     particles.registerStateVariableData<Vecd>("CG_RhoGrad", zero);
     particles.registerStateVariableData<Vecd>("CG_SGForce", zero);
+    // M1.3R Scheme E auxiliary field: conjugate of the density difference.
+    particles.registerStateVariableData<Real>("CG_SGConj", 0.0);
 
     particles.addEvolvingVariable<Vecd>("Velocity");
     particles.addEvolvingVariable<Vecd>("CG_Force");
     particles.addEvolvingVariable<Real>("CG_Rho");
     particles.addEvolvingVariable<Vecd>("CG_RhoGrad");
     particles.addEvolvingVariable<Vecd>("CG_SGForce");
+    particles.addEvolvingVariable<Real>("CG_SGConj");
 
     particles.addVariableToWrite<Vecd>("Velocity");
     particles.addVariableToWrite<Vecd>("CG_Force");
@@ -665,6 +675,9 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.noise_off = ToInt(a, "--noise-off=") != 0;
         else if (StartsWith(a, "--axisym-j-one="))
             run_options.axisym_j_one = ToInt(a, "--axisym-j-one=") != 0;
+        else if (StartsWith(a, "--axisym-interface-scheme="))
+            run_options.axisym_interface_scheme =
+                ToString(a, "--axisym-interface-scheme=");
         else if (StartsWith(a, "--area-fraction="))
             run_options.area_fraction = ToReal(a, "--area-fraction=");
         else if (StartsWith(a, "--resolution="))
@@ -750,6 +763,14 @@ void ParseCommandLine(int argc, char *argv[])
         throw std::runtime_error("--init must be scatter, cluster, lattice or film.");
     if (run_options.axisymmetric != "off" && run_options.axisymmetric != "filmonly")
         throw std::runtime_error("--axisymmetric must be off or filmonly.");
+    if (run_options.axisym_interface_scheme != "moving_j" &&
+        run_options.axisym_interface_scheme != "difference_energy")
+        throw std::runtime_error(
+            "--axisym-interface-scheme must be moving_j or difference_energy.");
+    if (run_options.axisym_interface_scheme == "difference_energy" && !Axisymmetric())
+        throw std::runtime_error(
+            "--axisym-interface-scheme=difference_energy requires --axisymmetric="
+            "filmonly; the legacy 2D path keeps the frozen A-1 moving-J energy.");
     if (run_options.axis_radius <= 0.0)
         throw std::runtime_error("--fibre-radius-const must be positive.");
     if (run_options.film_thickness <= 0.0)
@@ -1702,6 +1723,223 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
     Vecd *pos_;
 };
 
+//  M1.3R: Scheme E -- pairwise-difference interface energy
+//
+//      F_E = (lambda/2) V0^2 Sum_{i<j} J_ij Kt_ij (rho_i - rho_j)^2
+//      J_ij  = (r_i + r_j) / (2 R0)        (pair-midpoint axisymmetric weight)
+//      Kt_ij = c W(r_ij),   c = 144 / (5 h^2)   (closed form; see M1.3R report)
+//
+//  Continuum limit: (lambda/2) Int (r/R0) |grad rho|^2 dr dz, i.e. the planar
+//  branch with J = 1 is exactly the A-1 2D convention, so lambda = 12 keeps its
+//  meaning and no recalibration is needed.  The full physical measure 2 pi r is
+//  obtained by multiplying the energy by 2 pi R0 (a constant, absorbed in
+//  lambda_physical = 2 pi R0 * lambda).
+//
+//  Properties (all verified in tools/cg_analysis/m13r/m13r_scheme_e.py):
+//    * constant density  =>  energy and force are EXACTLY zero;
+//    * the force is the complete gradient of that same discrete energy
+//      (energy-force FD <= 1.4e-8 at delta = 1e-4, <= 7e-10 at 3e-6);
+//    * pairs are symmetric => f_ij = -f_ji => momentum conserving;
+//    * no reference-lattice labels => valid under large deformation;
+//    * cost: 3 neighbour sweeps (vs 2) and one extra Real per particle.
+//
+//  The measure factor enters as the PAIR midpoint, so there is no single-particle
+//  dJ/dr branch (the analogue of A-1's "term 2").  The surviving explicit
+//  dJ/dx and dW/dx branches are gated by (rho_i - rho_j)^2, which vanishes
+//  identically on a uniform density field -- that is the whole point.
+//=============================================================================
+inline bool PairDifferenceScheme()
+{
+    return Axisymmetric() &&
+           run_options.axisym_interface_scheme == "difference_energy";
+}
+
+/** pref = (lambda/2) V0^2 c, the coefficient multiplying J_ij W(r_ij). */
+inline Real SGDifferencePairPref()
+{
+    const Real V0 = 1.0 / run_options.interface_rho_ref;
+    const Real h = RhoSmoothingH();
+    const Real ck = 144.0 / (5.0 * h * h);
+    return 0.5 * run_options.interface_lambda * V0 * V0 * ck;
+}
+
+/** Sweep 2 of Scheme E: conjugate field  S_i = Sum_j 2 A_ij (rho_i - rho_j). */
+class CGSquareGradientConjugate : public LocalDynamics, public DataDelegateInner
+{
+  public:
+    explicit CGSquareGradientConjugate(BaseInnerRelation &inner_relation)
+        : LocalDynamics(inner_relation.getSPHBody()),
+          DataDelegateInner(inner_relation),
+          rho_(particles_->template getVariableDataByName<Real>("CG_Rho")),
+          conj_(particles_->template getVariableDataByName<Real>("CG_SGConj")),
+          pos_(particles_->template getVariableDataByName<Vecd>("Position")) {}
+
+    void interaction(size_t index_i, Real dt = 0.0)
+    {
+        if (run_options.interface_lambda <= 0.0)
+        {
+            conj_[index_i] = 0.0;
+            return;
+        }
+        const Real pref = SGDifferencePairPref();
+        const Real r0 = AxisRadius();
+        const Real ri = pos_[index_i][1];
+        Real s = 0.0;
+        const Neighborhood &neighborhood = inner_configuration_[index_i];
+        for (size_t n = 0; n != neighborhood.current_size_; ++n)
+        {
+            const size_t index_j = neighborhood.j_[n];
+            const Real r = neighborhood.r_ij_[n];
+            if (r <= TinyReal)
+                continue;
+            const Real w = RhoKernelW(r);
+            if (w <= 0.0)
+                continue;
+            const Real Jij = 0.5 * (ri + pos_[index_j][1]) / r0;
+            s += 2.0 * pref * Jij * w * (rho_[index_i] - rho_[index_j]);
+        }
+        conj_[index_i] = s;
+    }
+
+    void update(size_t index_i, Real dt = 0.0) {}
+
+  private:
+    Real *rho_;
+    Real *conj_;
+    Vecd *pos_;
+};
+
+/** Sweep 3 of Scheme E: F_k = -dF_E/dx_k  (complete gradient). */
+class CGSquareGradientDifferenceForce : public LocalDynamics,
+                                        public DataDelegateInner
+{
+  public:
+    explicit CGSquareGradientDifferenceForce(BaseInnerRelation &inner_relation)
+        : LocalDynamics(inner_relation.getSPHBody()),
+          DataDelegateInner(inner_relation),
+          force_(particles_->template getVariableDataByName<Vecd>("CG_Force")),
+          sg_force_(particles_->template getVariableDataByName<Vecd>("CG_SGForce")),
+          rho_(particles_->template getVariableDataByName<Real>("CG_Rho")),
+          conj_(particles_->template getVariableDataByName<Real>("CG_SGConj")),
+          grad_(particles_->template getVariableDataByName<Vecd>("CG_RhoGrad")),
+          pos_(particles_->template getVariableDataByName<Vecd>("Position")) {}
+
+    /** Single-particle force, evaluated from the CACHED neighbour geometry.
+     *  Used both by the production sweep and by the REF-CACHED check. */
+    Vecd ForceFromCachedGeometry(size_t index_i, size_t *count_terms = nullptr) const
+    {
+        if (run_options.interface_lambda <= 0.0)
+            return Vecd::Zero();
+        const Real pref = SGDifferencePairPref();
+        const Real r0 = AxisRadius();
+        const Real ri = pos_[index_i][1];
+        const Real rho_i = rho_[index_i];
+        // chain rule through rho: d rho_k / d x_k = +G_k  (verified against FD)
+        Vecd f = -conj_[index_i] * Vecd(grad_[index_i]);
+        const Vecd radial_hat(0.0, 1.0);
+        size_t nterm = 1;
+        const Neighborhood &neighborhood = inner_configuration_[index_i];
+        for (size_t n = 0; n != neighborhood.current_size_; ++n)
+        {
+            const size_t index_j = neighborhood.j_[n];
+            const Real r = neighborhood.r_ij_[n];
+            if (r <= TinyReal)
+                continue;
+            const Real w = RhoKernelW(r);
+            const Real dw = RhoKernelDW(r);
+            if (w <= 0.0 && dw == 0.0)
+                continue;
+            const Vecd e = neighborhood.e_ij_[n];
+            const Real Jij = 0.5 * (ri + pos_[index_j][1]) / r0;
+            // (1) neighbour part of the density chain rule
+            f -= conj_[index_j] * dw * e;
+            // (2) explicit d(measure)/dx and dW/dx branches, gated by (d rho)^2
+            const Real drho = rho_i - rho_[index_j];
+            f -= (drho * drho) * pref *
+                 ((0.5 / r0) * w * radial_hat + Jij * dw * e);
+            ++nterm;
+        }
+        if (count_terms != nullptr)
+            *count_terms = nterm;
+        return f;
+    }
+
+    void interaction(size_t index_i, Real dt = 0.0)
+    {
+        const Vecd f = ForceFromCachedGeometry(index_i);
+        sg_force_[index_i] = f;
+        force_[index_i] += f;
+    }
+
+    void update(size_t index_i, Real dt = 0.0) {}
+
+    /** REF-CACHED consistency check: recompute through a separate call path. */
+    Real CachedReferenceMaxRelativeError() const
+    {
+        const size_t total = particles_->TotalRealParticles();
+        Real dmax = 0.0, fmax = 0.0;
+        for (size_t i = 0; i != total; ++i)
+        {
+            const Vecd f = ForceFromCachedGeometry(i);
+            dmax = std::max(dmax, (f - Vecd(sg_force_[i])).norm());
+            fmax = std::max(fmax, sg_force_[i].norm());
+        }
+        return fmax > 0.0 ? dmax / fmax : 0.0;
+    }
+
+    /** Per-particle split: density-chain part vs explicit measure/kernel part. */
+    void DumpForceSplit(const std::string &path) const
+    {
+        std::ofstream csv(path);
+        csv << std::setprecision(17);
+        csv << "i,z,r,Fr_chain,Fr_explicit_J,Fr_total,Fz_total,rho,S,grad2\n";
+        const size_t total = particles_->TotalRealParticles();
+        const Real pref = SGDifferencePairPref();
+        const Real r0 = AxisRadius();
+        for (size_t i = 0; i != total; ++i)
+        {
+            Vecd fc = Vecd::Zero(), fe = Vecd::Zero();
+            if (run_options.interface_lambda > 0.0)
+            {
+                fc = -conj_[i] * Vecd(grad_[i]);
+                const Real ri = pos_[i][1];
+                const Real rho_i = rho_[i];
+                const Neighborhood &nb = inner_configuration_[i];
+                for (size_t n = 0; n != nb.current_size_; ++n)
+                {
+                    const size_t j = nb.j_[n];
+                    const Real r = nb.r_ij_[n];
+                    if (r <= TinyReal)
+                        continue;
+                    const Vecd e = nb.e_ij_[n];
+                    const Real w = RhoKernelW(r), dw = RhoKernelDW(r);
+                    if (w <= 0.0 && dw == 0.0)
+                        continue;
+                    const Real Jij = 0.5 * (ri + pos_[j][1]) / r0;
+                    fc -= conj_[j] * dw * e;
+                    const Real drho = rho_i - rho_[j];
+                    fe -= (drho * drho) * pref *
+                          ((0.5 / r0) * w * Vecd(0.0, 1.0) + Jij * dw * e);
+                }
+            }
+            const Vecd ft = fc + fe;
+            csv << i << "," << pos_[i][0] << "," << pos_[i][1] << ","
+                << fc[1] << "," << fe[1] << "," << ft[1] << "," << ft[0] << ","
+                << rho_[i] << "," << conj_[i] << ","
+                << grad_[i].squaredNorm() << "\n";
+        }
+        csv.close();
+    }
+
+  private:
+    Vecd *force_;
+    Vecd *sg_force_;
+    Real *rho_;
+    Real *conj_;
+    Vecd *grad_;
+    Vecd *pos_;
+};
+
 //=============================================================================
 //  Constraints (numerical, reported separately from the physics)
 //=============================================================================
@@ -2170,6 +2408,121 @@ void SGConfigForce(const std::vector<Vecd> &p, int mode, bool include_geom,
     }
 }
 
+//=============================================================================
+//  M1.3R: independent from-scratch reconstruction of Scheme E (diagnostic only)
+//=============================================================================
+inline Real SGDifferenceW(const Real r) { return RhoKernelW(r); }
+
+/** From-scratch Scheme E energy (brute force over all pairs, z minimum image). */
+Real SGDifferenceConfigEnergy(const std::vector<Vecd> &p)
+{
+    const Real h = RhoSmoothingH();
+    const Real lz = DomainLength();
+    const Real r0 = AxisRadius();
+    const size_t n = p.size();
+    std::vector<Real> rho(n, 0.0);
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = 0; j < n; ++j)
+        {
+            if (i == j)
+                continue;
+            Vecd d = p[i] - p[j];
+            d[0] -= lz * std::round(d[0] / lz);
+            const Real r = d.norm();
+            if (r <= TinyReal || r >= h)
+                continue;
+            rho[i] += SGDifferenceW(r);
+        }
+    const Real pref = SGDifferencePairPref();
+    Real acc = 0.0;
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = i + 1; j < n; ++j)
+        {
+            Vecd d = p[i] - p[j];
+            d[0] -= lz * std::round(d[0] / lz);
+            const Real r = d.norm();
+            if (r <= TinyReal || r >= h)
+                continue;
+            const Real Jij = 0.5 * (p[i][1] + p[j][1]) / r0;
+            const Real drho = rho[i] - rho[j];
+            acc += Jij * SGDifferenceW(r) * drho * drho;
+        }
+    return pref * acc;
+}
+
+/** From-scratch Scheme E force.  include_explicit = false drops the
+ *  d(measure)/dx + dW/dx branch and is the control that must FAIL the FD. */
+void SGDifferenceConfigForce(const std::vector<Vecd> &p, bool include_explicit,
+                             std::vector<Vecd> &F)
+{
+    const Real h = RhoSmoothingH();
+    const Real lz = DomainLength();
+    const Real r0 = AxisRadius();
+    const size_t n = p.size();
+    std::vector<Real> rho(n, 0.0);
+    std::vector<Vecd> grad(n, Vecd::Zero());
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = 0; j < n; ++j)
+        {
+            if (i == j)
+                continue;
+            Vecd d = p[i] - p[j];
+            d[0] -= lz * std::round(d[0] / lz);
+            const Real r = d.norm();
+            if (r <= TinyReal || r >= h)
+                continue;
+            rho[i] += SGDifferenceW(r);
+            grad[i] += RhoKernelDW(r) * (d / r);
+        }
+    const Real pref = SGDifferencePairPref();
+    std::vector<Real> S(n, 0.0);
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = 0; j < n; ++j)
+        {
+            if (i == j)
+                continue;
+            Vecd d = p[i] - p[j];
+            d[0] -= lz * std::round(d[0] / lz);
+            const Real r = d.norm();
+            if (r <= TinyReal || r >= h)
+                continue;
+            const Real Jij = 0.5 * (p[i][1] + p[j][1]) / r0;
+            S[i] += 2.0 * pref * Jij * SGDifferenceW(r) * (rho[i] - rho[j]);
+        }
+    F.assign(n, Vecd::Zero());
+    for (size_t i = 0; i < n; ++i)
+    {
+        F[i] = -S[i] * Vecd(grad[i]);   // d rho_i / d x_i = +grad_i
+        for (size_t j = 0; j < n; ++j)
+        {
+            if (i == j)
+                continue;
+            Vecd d = p[i] - p[j];
+            d[0] -= lz * std::round(d[0] / lz);
+            const Real r = d.norm();
+            if (r <= TinyReal || r >= h)
+                continue;
+            const Vecd e = d / r;
+            const Real drho = rho[i] - rho[j];
+            F[i] -= S[j] * RhoKernelDW(r) * e;
+            if (include_explicit)
+            {
+                const Real Jij = 0.5 * (p[i][1] + p[j][1]) / r0;
+                F[i] -= drho * drho * pref *
+                        ((0.5 / r0) * SGDifferenceW(r) * Vecd(0.0, 1.0) +
+                         Jij * RhoKernelDW(r) * e);
+            }
+        }
+    }
+}
+
+/** Scheme-aware from-scratch energy used by the FD sweep. */
+inline Real ConfigInterfaceEnergy(const std::vector<Vecd> &p, int mode)
+{
+    return PairDifferenceScheme() ? SGDifferenceConfigEnergy(p)
+                                  : SGConfigEnergy(p, mode);
+}
+
 struct SGSweepResult
 {
     // Absolute errors are normalised by the largest force in the configuration,
@@ -2217,9 +2570,9 @@ SGSweepResult SGFinitDifferenceSweep(std::vector<Vecd> p, int mode,
         {
             const Real saved = p[i][comp];
             p[i][comp] = saved + delta;
-            const Real ep = SGConfigEnergy(p, mode);
+            const Real ep = ConfigInterfaceEnergy(p, mode);
             p[i][comp] = saved - delta;
-            const Real em = SGConfigEnergy(p, mode);
+            const Real em = ConfigInterfaceEnergy(p, mode);
             p[i][comp] = saved;
             const Real fd = -(ep - em) / (2.0 * delta);
             const Real an = target[i][comp];
@@ -2298,8 +2651,16 @@ void RunSGFinitDifferenceCheck(
     // with the dJ/dr branch subtracted analytically, which must FAIL the FD
     // test and thereby demonstrate that the branch is required.
     std::vector<Vecd> f_ref, f_nogeo;
-    SGConfigForce(p, 0, true, f_ref);   // independent formula, WITH dJ/dr
-    SGConfigForce(p, 0, false, f_nogeo); // control: dJ/dr removed
+    if (PairDifferenceScheme())
+    {
+        SGDifferenceConfigForce(p, true, f_ref);   // independent Scheme E formula
+        SGDifferenceConfigForce(p, false, f_nogeo); // control: explicit branch off
+    }
+    else
+    {
+        SGConfigForce(p, 0, true, f_ref);   // independent formula, WITH dJ/dr
+        SGConfigForce(p, 0, false, f_nogeo); // control: dJ/dr removed
+    }
 
     // Cross-check the two independent reconstructions of rho and grad rho.
     // If these disagree, nothing downstream can be trusted.
@@ -2714,6 +3075,23 @@ static int RunCgCase(int ac, char *av[])
     InteractionWithUpdate<CGPairInteraction> pair_interaction(particles_inner);
     InteractionWithUpdate<CGSquareGradientDensity> sg_density(particles_inner);
     InteractionWithUpdate<CGSquareGradientForce> sg_force(particles_inner);
+    InteractionWithUpdate<CGSquareGradientConjugate> sg_conjugate(particles_inner);
+    InteractionWithUpdate<CGSquareGradientDifferenceForce> sg_diff_force(particles_inner);
+
+    // M1.3R: the active interface-energy scheme.  moving_j = frozen A-1 path;
+    // difference_energy = Scheme E (needs one extra conjugate sweep).
+    auto exec_interface_energy = [&](Real dt) {
+        sg_density.exec(dt);
+        if (PairDifferenceScheme())
+        {
+            sg_conjugate.exec(dt);
+            sg_diff_force.exec(dt);
+        }
+        else
+        {
+            sg_force.exec(dt);
+        }
+    };
     CGWallForce wall_force(particles_body);
     CGInitialVelocity initial_velocity(particles_body);
     CGLangevinKick langevin_kick(particles_body);
@@ -2761,6 +3139,10 @@ static int RunCgCase(int ac, char *av[])
         row("axisymmetric", run_options.axisymmetric,
             "off = legacy 2D (x,y); filmonly = (z,r) cylinder R=R0 const "
             "(geometry scaffold only: no 2 pi r weighting, no measure term)");
+        row("axisym_interface_scheme", run_options.axisym_interface_scheme,
+            "moving_j = Scheme A (lambda V0/2) Sum_i J_i |G_i|^2 (frozen); "
+            "difference_energy = Scheme E (lambda/2) V0^2 Sum_{i<j} J_ij Kt_ij "
+            "(rho_i-rho_j)^2, Kt = 144/(5 h^2) W; axisymmetric only");
         row("axis_radius_const", std::to_string(run_options.axis_radius),
             "R0/sigma, constant-radius (z,r) cylinder; active when axisymmetric!=off");
         row("film_thickness", std::to_string(run_options.film_thickness),
@@ -2905,13 +3287,15 @@ static int RunCgCase(int ac, char *av[])
     pair_interaction.ResetCounters();
     pair_interaction.exec();
     wall_force.exec();
-    sg_density.exec();
-    sg_force.exec();
+    exec_interface_energy(0.0);
 
     // N3 diagnostic: dump the term(1)/term(2) split once, at t = 0.
     if (run_options.sg_force_dump != 0)
     {
-        sg_force.DumpForceSplit("sg_force_split.csv");
+        if (PairDifferenceScheme())
+            sg_diff_force.DumpForceSplit("sg_force_split.csv");
+        else
+            sg_force.DumpForceSplit("sg_force_split.csv");
         std::cout << "  sg force split -> sg_force_split.csv\n";
     }
 
@@ -2928,7 +3312,8 @@ static int RunCgCase(int ac, char *av[])
             particles_body.getBaseParticles().getVariableDataByName<Real>("CG_Rho"),
             particles_body.getBaseParticles().getVariableDataByName<Vecd>("CG_RhoGrad"),
             particles_body.getBaseParticles().TotalRealParticles(),
-            sg_force.CachedReferenceMaxRelativeError());
+            PairDifferenceScheme() ? sg_diff_force.CachedReferenceMaxRelativeError()
+                                   : sg_force.CachedReferenceMaxRelativeError());
         return 0;
     }
 
@@ -3020,8 +3405,7 @@ static int RunCgCase(int ac, char *av[])
 
         pair_interaction.exec(dt_now);
         wall_force.exec(dt_now);
-        sg_density.exec(dt_now);
-        sg_force.exec(dt_now);
+        exec_interface_energy(dt_now);
         langevin_kick.exec(dt_now);   // B/2 with F(x_new)
 
         physical_time += dt_now;
@@ -3073,3 +3457,4 @@ int main(int ac, char *av[])
         return 2;
     }
 }
+//=============================================================================
