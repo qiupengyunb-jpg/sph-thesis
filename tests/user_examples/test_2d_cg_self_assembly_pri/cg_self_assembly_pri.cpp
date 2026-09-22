@@ -1826,6 +1826,17 @@ struct FrameDiagnostics
     Real sg_force_rms = 0.0;
     Real sg_force_max = 0.0;
     Real sg_net_force = 0.0;
+    // M1.3 / N0: READ-ONLY interface-energy diagnostics.  They are never used to
+    // build any force; they only make the discrete functional evaluable so that
+    // the N1 energy-force finite-difference check has something to compare to.
+    //   sg_energy                    : (lambda V0 / 2) Sum_i J_i |G_i|^2
+    //   sg_energy_planar_reference   : same sum with J == 1 (the legacy 2D A-1)
+    //   sg_energy_raw_2pir           : same sum with J = 2 pi r (diagnostic only)
+    Real sg_energy = 0.0;
+    Real sg_energy_planar_reference = 0.0;
+    Real sg_energy_raw_2pir = 0.0;
+    Real sg_J_min = 1.0;
+    Real sg_J_max = 1.0;
 };
 
 FrameDiagnostics CollectDiagnostics(RealBody &real_body)
@@ -1846,6 +1857,9 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
     Real rho_sum = 0.0, rho_min = std::numeric_limits<Real>::max(), rho_max = 0.0;
     Real f2_sum = 0.0;
     Vecd f_net = Vecd::Zero();
+    Real e_weighted = 0.0, e_planar = 0.0, e_raw = 0.0;
+    Real j_min = std::numeric_limits<Real>::max();
+    Real j_max = 0.0;
     for (size_t i = 0; i != d.particle_number; ++i)
     {
         const Real v2 = vel[i].squaredNorm();
@@ -1869,6 +1883,16 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
             f2_sum += fn * fn;
             d.sg_force_max = std::max(d.sg_force_max, fn);
             f_net += sgf[i];
+            // M1.3 / N0 read-only energies.  J is the axisymmetric measure
+            // factor: J = r/R0 in axisymmetric mode, J = 1 otherwise (so the
+            // legacy 2D path degenerates to the planar reference exactly).
+            const Real g2 = grad[i].squaredNorm();
+            const Real J = Axisymmetric() ? (pos[i][1] / AxisRadius()) : 1.0;
+            e_weighted += J * g2;
+            e_planar += g2;
+            e_raw += (2.0 * Pi * pos[i][1]) * g2;
+            j_min = std::min(j_min, J);
+            j_max = std::max(j_max, J);
         }
     }
     const Real n = static_cast<Real>(d.particle_number);
@@ -1884,6 +1908,13 @@ FrameDiagnostics CollectDiagnostics(RealBody &real_body)
         d.sg_rho_max = rho_max;
         d.sg_force_rms = std::sqrt(f2_sum / n);
         d.sg_net_force = f_net.norm();
+        const Real energy_scale =
+            0.5 * run_options.interface_lambda / run_options.interface_rho_ref;
+        d.sg_energy = energy_scale * e_weighted;
+        d.sg_energy_planar_reference = energy_scale * e_planar;
+        d.sg_energy_raw_2pir = energy_scale * e_raw;
+        d.sg_J_min = (j_min == std::numeric_limits<Real>::max()) ? 1.0 : j_min;
+        d.sg_J_max = (j_max == 0.0) ? 1.0 : j_max;
     }
     return d;
 }
@@ -2259,7 +2290,9 @@ static int RunCgCase(int ac, char *av[])
                  "wall_guard_hits,wall_contact_hits,"
                  "wrapped_count,escaped_count,periodic_pairs,dt,steps,"
                  "sg_rho_mean,sg_rho_min,sg_rho_max,sg_grad_max,"
-                 "sg_force_rms,sg_force_max,sg_net_force\n";
+                 "sg_force_rms,sg_force_max,sg_net_force,"
+                 "sg_energy,sg_energy_planar_reference,sg_energy_raw_2pir,"
+                 "sg_J_min,sg_J_max\n";
     selfcheck << std::setprecision(10);
 
     auto report = [&](Real time, Real dt_now, size_t steps, bool write_frame) {
@@ -2281,7 +2314,10 @@ static int RunCgCase(int ac, char *av[])
                   << steps << ","
                   << d.sg_rho_mean << "," << d.sg_rho_min << "," << d.sg_rho_max << ","
                   << d.sg_grad_max << "," << d.sg_force_rms << ","
-                  << d.sg_force_max << "," << d.sg_net_force << "\n";
+                  << d.sg_force_max << "," << d.sg_net_force << ","
+                  << d.sg_energy << "," << d.sg_energy_planar_reference << ","
+                  << d.sg_energy_raw_2pir << ","
+                  << d.sg_J_min << "," << d.sg_J_max << "\n";
         selfcheck.flush();
         std::cout << std::fixed << std::setprecision(4)
                   << "T=" << time << " N=" << d.particle_number
@@ -2294,6 +2330,9 @@ static int RunCgCase(int ac, char *av[])
                   << " hard=" << constraints.WallContactHits()
                   << " wrapped=" << constraints.WrapCount()
                   << " periodic_pairs=" << pair_interaction.PeriodicPairCount()
+                  << " sgE=" << d.sg_energy
+                  << " sgE_planar=" << d.sg_energy_planar_reference
+                  << " J=[" << d.sg_J_min << "," << d.sg_J_max << "]"
                   << " dt=" << dt_now << "\n";
         if (write_frame)
             body_states_recording.writeToFile(steps);
