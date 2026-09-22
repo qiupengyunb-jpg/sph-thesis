@@ -469,6 +469,17 @@ Real WallAlpha() { return run_options.wall_alpha / Sigma(); }
 Real WallRe() { return run_options.wall_re * Sigma(); }
 Real WallCutoff() { return run_options.wall_cutoff * Sigma(); }
 
+// M1.2: innermost film layer = the wall well position (stable contact
+// distance), where the wall force is exactly zero.  Same semantics as PC2's
+// A-5 helper of the same name, so the two film builders start from an
+// identical h_in.  With the default wall_re = 0.5 sigma this is 0.5 sigma.
+Real FilmInnerOffset()
+{
+    return (run_options.wall_depth_d0 > 0.0 ? run_options.wall_re
+                                            : run_options.wall_contact_h) *
+           Sigma();
+}
+
 /** Distance from the particle centre to the nearest fibre surface. */
 inline Real WallDistance(const Vecd &p)
 {
@@ -721,8 +732,8 @@ void ParseCommandLine(int argc, char *argv[])
         run_options.fibre_shape != "none")
         throw std::runtime_error("--fibre-shape must be strip, cylinder or none.");
     if (run_options.init_mode != "scatter" && run_options.init_mode != "cluster" &&
-        run_options.init_mode != "lattice")
-        throw std::runtime_error("--init must be scatter, cluster or lattice.");
+        run_options.init_mode != "lattice" && run_options.init_mode != "film")
+        throw std::runtime_error("--init must be scatter, cluster, lattice or film.");
     if (run_options.axisymmetric != "off" && run_options.axisymmetric != "filmonly")
         throw std::runtime_error("--axisymmetric must be off or filmonly.");
     if (run_options.axis_radius <= 0.0)
@@ -761,6 +772,38 @@ void ParseCommandLine(int argc, char *argv[])
             throw std::runtime_error(
                 "axisymmetric geometry leaves no radial room: need "
                 "R0 + exclusion_margin + 4 sigma < --domain-height.");
+    }
+    if (run_options.init_mode == "film")
+    {
+        // M1.2: the film builder exists only for the (z,r) cylinder on this
+        // branch.  Refusing everything else keeps the flat-wall strip film
+        // (PC2, branch pc2-a5-film) out of this implementation on purpose.
+        if (!Axisymmetric())
+            throw std::runtime_error(
+                "--init=film is implemented only for --axisymmetric=filmonly on "
+                "this branch; the flat-wall strip film lives on PC2's "
+                "pc2-a5-film branch and is deliberately not copied here.");
+        const Real phi = run_options.cluster_packing;
+        if (phi <= 0.05 || phi >= 0.72)
+            throw std::runtime_error(
+                "--cluster-packing must be in (0.05,0.72); 0.72 is the triangular "
+                "lattice limit set by the WCA contact distance.");
+        const Real h_in = FilmInnerOffset();
+        if (run_options.film_thickness <= h_in)
+            throw std::runtime_error(
+                "--film-thickness must exceed the wall well position (the stable "
+                "contact distance), otherwise the film would start inside the wall.");
+        // Conservative fit bound: the layer count is derived from the lattice,
+        // so allow one extra layer beyond the requested thickness.
+        const Real sigma = Sigma();
+        const Real d_lat =
+            sigma * std::sqrt((0.25 * Pi) / (0.5 * std::sqrt(3.0) * phi));
+        const Real dr_lat = 0.5 * std::sqrt(3.0) * d_lat;
+        const Real reach_r = AxisRadius() + h_in + run_options.film_thickness + dr_lat;
+        if (reach_r + sigma >= run_options.domain_height)
+            throw std::runtime_error(
+                "--init=film: fibre plus film does not fit inside the domain "
+                "(need R0 + h_in + h_film + dr + sigma < --domain-height).");
     }
     if (run_options.init_mode == "cluster")
     {
@@ -907,6 +950,11 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
         if (run_options.init_mode == "lattice")
         {
             prepareUniformLattice();
+            return;
+        }
+        if (run_options.init_mode == "film")
+        {
+            prepareFilm();
             return;
         }
         const int target = TargetParticleNumber();
@@ -1108,6 +1156,199 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
                   << " N=" << added << " d=" << d << " row=" << row
                   << " packing=" << packing
                   << " rho=" << packing / (0.25 * Pi * sigma * sigma) << "\n";
+    }
+
+    /**
+     * M1.2 initial film: pure dispatcher.  Geometry selection lives here and
+     * ONLY here, so the two film builders never share a hidden branch.
+     */
+    void prepareFilm()
+    {
+        if (Axisymmetric())
+        {
+            prepareAxisymmetricFilm();
+            return;
+        }
+        throw std::runtime_error(
+            "--init=film is implemented only for --axisymmetric=filmonly on this "
+            "branch; the flat-wall strip film lives on PC2's pc2-a5-film branch "
+            "and is deliberately not copied here.");
+    }
+
+    /**
+     * M1.2: continuous film outside a CONSTANT-RADIUS (z,r) cylinder.
+     *
+     * Geometry.  In the axisymmetric branch x -> z (fibre axis, periodic) and
+     * y -> r (distance from the axis), the fibre is R(z) = R0 = const and the
+     * film occupies the annulus
+     *     R0 + h_in  <=  r  <=  R0 + h_in + (rows-1)*dr.
+     * Layers are surfaces of constant r, so h(z) is constant along z by
+     * construction and the "no holes / continuous film" requirement reduces to
+     * "every layer is a complete, evenly spaced z line".
+     *
+     * Inherited from PC2's A-5 strip film (verified there, reused here as
+     * rules only -- the code is NOT copied):
+     *     d  = sigma sqrt( (pi/4) / ( (sqrt(3)/2) packing ) )   nearest neighbour
+     *     dr = (sqrt(3)/2) d                                     layer spacing
+     *     n  = round(Lz/d),  dz = Lz/n                            seam-free period
+     *     odd layers shifted by 0.5 dz                            triangular order
+     *     innermost layer at h = FilmInnerOffset() = 0.5 sigma    wall force = 0
+     *     N = rows*n derived from geometry alone, never hand-set
+     *     realised_thickness = rows*dr
+     * so the areal density is the project-wide bulk value
+     * packing/(pi sigma^2/4) = 0.8913 sigma^-2 at packing 0.70.
+     *
+     * SCOPE.  This is a GEOMETRY initialiser only.  Particles carry m = 1 and
+     * are laid out uniformly in the (z,r) plane, so the implied 3D bead number
+     * density scales as 1/r.  That is the known O(h/R) approximation of this
+     * stage and is deliberately NOT corrected here (no 2 pi r weighting, no
+     * variable mass, no measure term, no density correction).
+     */
+    void prepareAxisymmetricFilm()
+    {
+        const Real sigma = Sigma();
+        const Real phi = run_options.cluster_packing;
+        const Real d = sigma * std::sqrt((0.25 * Pi) / (0.5 * std::sqrt(3.0) * phi));
+        const Real dr = 0.5 * std::sqrt(3.0) * d;
+        const Real h_in = FilmInnerOffset();
+        const Real h_out = run_options.film_thickness;
+        const Real lz = DomainLength();
+        const Real radius = AxisRadius();
+        const int n = std::max(3, static_cast<int>(std::floor(lz / d + 0.5)));
+        const Real dz = lz / static_cast<Real>(n);
+
+        std::vector<Vecd> placed;
+        std::vector<Real> layer_r;
+        std::vector<int> layer_n;
+        placed.reserve(256);
+        int rows = 0;
+        Real h_first = 0.0;
+        Real h_last = 0.0;
+        for (int layer = 0;; ++layer)
+        {
+            const Real h = h_in + static_cast<Real>(layer) * dr;
+            if (h > h_out + 1.0e-9)
+                break;
+            const Real r = radius + h;
+            const Real shift = ((layer % 2) ? 0.5 : 0.0) * dz;
+            for (int k = 0; k < n; ++k)
+            {
+                Real z = shift + static_cast<Real>(k) * dz;
+                z -= lz * std::floor(z / lz);
+                const Vecd p(z, r);
+                addPositionAndVolumetricMeasure(p, 1.0);
+                placed.push_back(p);
+            }
+            if (rows == 0)
+                h_first = h;
+            h_last = h;
+            layer_r.push_back(r);
+            layer_n.push_back(n);
+            ++rows;
+        }
+        if (placed.empty())
+            throw std::runtime_error(
+                "--init=film produced no particles; check --film-thickness, the "
+                "fibre geometry and the domain size.");
+
+        // Realised geometry.  Every layer stands for one dr-thick band, so the
+        // built band is rows*dr thick and holds exactly the requested packing.
+        const Real realised_thickness = static_cast<Real>(rows) * dr;
+        const size_t kept = placed.size();
+        const Real areal_density =
+            static_cast<Real>(kept) / (lz * realised_thickness);
+        const Real lattice_rho = phi / (0.25 * Pi * sigma * sigma);
+        const Real geometric_annulus_volume =
+            Pi * ((radius + h_out) * (radius + h_out) - radius * radius) * lz;
+        const Real r_in_band = radius + h_in;
+        const Real r_out_band = radius + h_in + realised_thickness;
+        const Real initialized_band_volume =
+            Pi * (r_out_band * r_out_band - r_in_band * r_in_band) * lz;
+
+        // True minimum pair distance of the built configuration, with the
+        // minimum image in z (periodic).  O(N^2) is fine: N is a few hundred.
+        Real min_pair = std::numeric_limits<Real>::max();
+        for (size_t i = 0; i < kept; ++i)
+            for (size_t j = i + 1; j < kept; ++j)
+            {
+                Vecd delta = placed[i] - placed[j];
+                delta[0] -= lz * std::round(delta[0] / lz);
+                min_pair = std::min(min_pair, delta.norm());
+            }
+        const Real min_wall_distance = h_first;
+
+        std::cout << "  film: shape=axisymmetric_cylinder R0=" << radius
+                  << " d_min=" << h_in << " H_f=" << h_out
+                  << " rows=" << rows
+                  << " h_first=" << h_first << " h_last=" << h_last
+                  << " N=" << kept
+                  << " d=" << d << " dr=" << dr << " dz=" << dz << " n=" << n
+                  << " min_surface_distance=" << min_wall_distance
+                  << " initial_thickness=" << h_out
+                  << " realised_thickness=" << realised_thickness
+                  << " particle_count=" << kept
+                  << " geometric_annulus_volume=" << geometric_annulus_volume
+                  << " initialized_band_volume=" << initialized_band_volume
+                  << " areal_density=" << areal_density
+                  << " lattice_rho=" << lattice_rho
+                  << " min_pair_distance=" << min_pair << "\n";
+
+        std::ofstream csv("axisym_film_selfcheck.csv");
+        csv << std::setprecision(10);
+        csv << "quantity,value,note\n";
+        auto row = [&](const std::string &k, const std::string &v,
+                       const char *note) { csv << k << "," << v << "," << note << "\n"; };
+        row("init_mode", run_options.init_mode, "film initial state");
+        row("geometry", "axisymmetric_cylinder",
+            "(z,r) constant-radius cylinder; x->z periodic, y->r");
+        row("R0", std::to_string(radius), "sigma; R(z) = R0 const");
+        row("packing", std::to_string(phi), "areal packing used by the lattice");
+        row("d", std::to_string(d), "triangular nearest neighbour");
+        row("dr", std::to_string(dr), "(sqrt(3)/2) d; radial layer spacing");
+        row("n_per_layer", std::to_string(n), "max(3, round(Lz/d))");
+        row("dz", std::to_string(dz), "Lz/n; periodic, seam-free");
+        row("Lz", std::to_string(lz), "axial period");
+        row("requested_thickness", std::to_string(h_out),
+            "H_f as requested on the command line");
+        row("realised_thickness", std::to_string(realised_thickness),
+            "rows*dr; USE THIS ONE for any downstream geometry comparison");
+        row("realised_minus_requested", std::to_string(realised_thickness - h_out),
+            "quantisation of the film thickness by dr");
+        row("radial_rows", std::to_string(rows), "number of radial layers");
+        row("particle_count", std::to_string(kept), "N = rows*n, never hand-set");
+        row("min_wall_distance", std::to_string(min_wall_distance),
+            "min(r - R0); must equal d_min and stay > 0");
+        row("min_pair_distance", std::to_string(min_pair),
+            "true minimum pair distance incl. z minimum image; WCA contact = "
+            "1.122462 sigma");
+        row("wca_contact_distance", std::to_string(std::pow(2.0, 1.0 / 6.0) * sigma),
+            "2^(1/6) sigma; min_pair_distance must exceed this");
+        row("geometric_annulus_volume", std::to_string(geometric_annulus_volume),
+            "pi[(R0+h_f)^2 - R0^2] Lz; theoretical target annulus, from the "
+            "fibre surface");
+        row("initialized_band_volume", std::to_string(initialized_band_volume),
+            "pi[(R0+h_in+T)^2 - (R0+h_in)^2] Lz; the band actually populated");
+        row("particle_number_over_geometric_annulus_volume",
+            std::to_string(static_cast<Real>(kept) / geometric_annulus_volume),
+            "N / geometric_annulus_volume -- DIAGNOSTIC ONLY: with m=1 and "
+            "uniform (z,r) sampling this is NOT a corrected 3D axisymmetric "
+            "number density");
+        row("particle_number_over_initialized_band_volume",
+            std::to_string(static_cast<Real>(kept) / initialized_band_volume),
+            "N / initialized_band_volume -- same caveat as above");
+        row("areal_density", std::to_string(areal_density),
+            "N / (Lz * realised_thickness); should match lattice_rho");
+        row("lattice_rho", std::to_string(lattice_rho),
+            "packing / (pi sigma^2 / 4); bulk areal density");
+        for (int i = 0; i < rows; ++i)
+        {
+            row("layer_" + std::to_string(i) + "_r", std::to_string(layer_r[i]),
+                "radius of this layer; must be R0 + h_in + i*dr");
+            row("layer_" + std::to_string(i) + "_count",
+                std::to_string(layer_n[i]), "particles in this layer; must equal n");
+        }
+        csv.close();
+        std::cout << "  film selfcheck -> axisym_film_selfcheck.csv\n";
     }
 };
 
@@ -1866,7 +2107,13 @@ static int RunCgCase(int ac, char *av[])
         row("axis_radius_const", std::to_string(run_options.axis_radius),
             "R0/sigma, constant-radius (z,r) cylinder; active when axisymmetric!=off");
         row("film_thickness", std::to_string(run_options.film_thickness),
-            "h0/sigma, uniform annular film; placeholder until M1.2");
+            "H_f/sigma, REQUESTED film thickness; use realised_thickness from "
+            "axisym_film_selfcheck.csv for geometry comparisons");
+        row("film_inner_offset", std::to_string(FilmInnerOffset()),
+            "d_min: innermost layer radius offset = wall well position (0.5 sigma)");
+        row("film_source", Axisymmetric() ? "axisymmetric_annulus" : "none",
+            "which builder produced the film; strip film lives on PC2's "
+            "pc2-a5-film branch and is not present here");
         row("film_perturb_amp", std::to_string(run_options.film_perturb_amp),
             "A/sigma, axial modulation amplitude; 0 = none");
         row("film_perturb_mode", std::to_string(run_options.film_perturb_mode),
