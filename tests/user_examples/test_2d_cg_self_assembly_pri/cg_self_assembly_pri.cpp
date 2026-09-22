@@ -132,6 +132,21 @@ struct RunOptions
     Real interface_h = 2.0;        /**< kernel support h_rho / sigma */
     Real interface_rho_ref = 0.88; /**< V0 = 1/rho_ref, the volume per particle */
 
+    // ---- M1 axisymmetric (z,r) scaffold ------------------------------------
+    //  Stage M1.0 only INTRODUCES the switch.  "off" is the sole accepted
+    //  value for now: every other value is rejected in ParseCommandLine, so
+    //  no numeric path can change and the A-1/A-2 trajectories stay
+    //  bit-identical.  The remaining fields are placeholders reserved for
+    //  M1.1 (constant-radius geometry) and M1.2 (film initial state).
+    //  Axisymmetric convention: z = fibre axis (periodic), r = radial
+    //  coordinate measured from the fibre axis, wall distance h = r - R.
+    std::string axisymmetric = "off"; /**< off | filmonly */
+    Real axis_radius = 5.0;           /**< R0 / sigma, CONSTANT radius only */
+    Real film_thickness = 2.5;        /**< h0 / sigma, uniform annular film */
+    Real film_perturb_amp = 0.0;      /**< A / sigma, 0 = no axial modulation */
+    int film_perturb_mode = 1;        /**< n in A sin(2 pi n z / Lz) */
+    bool axisym_jacobian = false;     /**< explicit -kBT ln(2 pi r) measure */
+
     Real initial_separation = 1.0;
     Real exclusion_margin = 0.50;
     std::string initial_velocity = "maxwell";
@@ -583,6 +598,18 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.interface_h = ToReal(a, "--interface-gradient-h=");
         else if (StartsWith(a, "--interface-gradient-rho-ref="))
             run_options.interface_rho_ref = ToReal(a, "--interface-gradient-rho-ref=");
+        else if (StartsWith(a, "--axisymmetric="))
+            run_options.axisymmetric = ToString(a, "--axisymmetric=");
+        else if (StartsWith(a, "--fibre-radius-const="))
+            run_options.axis_radius = ToReal(a, "--fibre-radius-const=");
+        else if (StartsWith(a, "--film-thickness="))
+            run_options.film_thickness = ToReal(a, "--film-thickness=");
+        else if (StartsWith(a, "--film-perturb-amp="))
+            run_options.film_perturb_amp = ToReal(a, "--film-perturb-amp=");
+        else if (StartsWith(a, "--film-perturb-mode="))
+            run_options.film_perturb_mode = ToInt(a, "--film-perturb-mode=");
+        else if (StartsWith(a, "--axisym-jacobian="))
+            run_options.axisym_jacobian = ToInt(a, "--axisym-jacobian=") != 0;
         else if (StartsWith(a, "--area-fraction="))
             run_options.area_fraction = ToReal(a, "--area-fraction=");
         else if (StartsWith(a, "--resolution="))
@@ -666,6 +693,20 @@ void ParseCommandLine(int argc, char *argv[])
     if (run_options.init_mode != "scatter" && run_options.init_mode != "cluster" &&
         run_options.init_mode != "lattice")
         throw std::runtime_error("--init must be scatter, cluster or lattice.");
+    // M1.0 zero-path gate: the axisymmetric branch is scaffolded but NOT
+    // implemented.  Refusing every non-off value here is what makes the
+    // stage-1 bitwise regression meaningful: there is no reachable code that
+    // could perturb the legacy trajectory.
+    if (run_options.axisymmetric != "off")
+        throw std::runtime_error(
+            "--axisymmetric=" + run_options.axisymmetric +
+            " is not implemented yet (M1.0 scaffold only); use --axisymmetric=off.");
+    if (run_options.axis_radius <= 0.0)
+        throw std::runtime_error("--fibre-radius-const must be positive.");
+    if (run_options.film_thickness <= 0.0)
+        throw std::runtime_error("--film-thickness must be positive.");
+    if (run_options.film_perturb_mode < 1)
+        throw std::runtime_error("--film-perturb-mode must be at least 1.");
     if (run_options.init_mode == "cluster")
     {
         if (run_options.cluster_count < 8)
@@ -1565,6 +1606,8 @@ static int RunCgCase(int ac, char *av[])
               << "  reduced units: m=1 sigma=" << Sigma()
               << " k_BT=" << run_options.temperature
               << " gamma=" << run_options.friction << "\n"
+              << "  axisymmetric mode=" << run_options.axisymmetric
+              << " (M1.0 scaffold; off = legacy 2D path, bit-identical)\n"
               << "  domain=" << DomainLength() << " x " << DomainHeight()
               << " (periodic in x) fibre_half_width=" << FibreHalfWidth() << "\n"
               << "  area_fraction=" << run_options.area_fraction
@@ -1672,6 +1715,18 @@ static int RunCgCase(int ac, char *av[])
             "FDT-consistent: c1=exp(-gamma dt), c2=sqrt(kBT(1-c1^2))");
         row("noise_key", "seed + OriginalID + timestep + component",
             "counter-based SplitMix64; independent of thread schedule");
+        row("axisymmetric", run_options.axisymmetric,
+            "off = legacy 2D (z,r) path; filmonly reserved for M1.1+");
+        row("axis_radius_const", std::to_string(run_options.axis_radius),
+            "R0/sigma, constant-radius fibre; placeholder until M1.1");
+        row("film_thickness", std::to_string(run_options.film_thickness),
+            "h0/sigma, uniform annular film; placeholder until M1.2");
+        row("film_perturb_amp", std::to_string(run_options.film_perturb_amp),
+            "A/sigma, axial modulation amplitude; 0 = none");
+        row("film_perturb_mode", std::to_string(run_options.film_perturb_mode),
+            "n in A sin(2 pi n z / Lz)");
+        row("axisym_jacobian", run_options.axisym_jacobian ? "1" : "0",
+            "explicit -kBT ln(2 pi r) measure; off by default in M1");
         row("wca_epsilon", std::to_string(run_options.wca_epsilon), "A-level form");
         row("wca_sigma", std::to_string(Sigma()), "");
         row("wca_cutoff", std::to_string(WCACutoff()), "2^(1/6) sigma, energy shifted");
