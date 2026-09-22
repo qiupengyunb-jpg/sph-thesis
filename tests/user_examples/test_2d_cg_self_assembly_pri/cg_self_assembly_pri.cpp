@@ -147,6 +147,11 @@ struct RunOptions
     int film_perturb_mode = 1;        /**< n in A sin(2 pi n z / Lz) */
     bool axisym_jacobian = false;     /**< explicit -kBT ln(2 pi r) measure */
     int sg_fd_check = 0; /**< M1.3/N1: run the energy-force FD check and exit */
+    // ---- N3 diagnostic-only switches (all default OFF; none changes the
+    //      production trajectory when left at its default) ------------------
+    int sg_force_dump = 0;    /**< dump per-particle term(1)/term(2) force split */
+    bool noise_off = false;   /**< T = 0 diagnostic: zero the OU noise amplitude */
+    bool axisym_j_one = false;/**< force J = 1 in the (z,r) branch (J control) */
 
     Real initial_separation = 1.0;
     Real exclusion_margin = 0.50;
@@ -654,6 +659,12 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.axisym_jacobian = ToInt(a, "--axisym-jacobian=") != 0;
         else if (StartsWith(a, "--sg-fd-check="))
             run_options.sg_fd_check = ToInt(a, "--sg-fd-check=");
+        else if (StartsWith(a, "--sg-force-dump="))
+            run_options.sg_force_dump = ToInt(a, "--sg-force-dump=");
+        else if (StartsWith(a, "--noise-off="))
+            run_options.noise_off = ToInt(a, "--noise-off=") != 0;
+        else if (StartsWith(a, "--axisym-j-one="))
+            run_options.axisym_j_one = ToInt(a, "--axisym-j-one=") != 0;
         else if (StartsWith(a, "--area-fraction="))
             run_options.area_fraction = ToReal(a, "--area-fraction=");
         else if (StartsWith(a, "--resolution="))
@@ -1532,8 +1543,11 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
         // DISCRETE ENERGY   F = (lambda V0 / 2) Sum_i J_i |G_i|^2 .
         // With J == 1 this loop is IDENTICAL to the pre-M1.3 2D A-1 force.
         const bool axisym = Axisymmetric();
-        const Real r0 = axisym ? AxisRadius() : 1.0;
-        const Real J_i = axisym ? (pos_[index_i][1] / r0) : 1.0;
+        // N3 J control: --axisym-j-one=1 forces J = 1 inside the (z,r) branch,
+        // which also kills the dJ/dr branch (2).  Default off = production.
+        const bool j_weighted = axisym && !run_options.axisym_j_one;
+        const Real r0 = j_weighted ? AxisRadius() : 1.0;
+        const Real J_i = j_weighted ? (pos_[index_i][1] / r0) : 1.0;
         Vecd f = Vecd::Zero();
         const Neighborhood &neighborhood = inner_configuration_[index_i];
         for (size_t n = 0; n != neighborhood.current_size_; ++n)
@@ -1549,7 +1563,7 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
             // Complete variation of the J-weighted energy: the pair difference
             // carries the weight, i.e. (J_k G_k - J_j G_j), not (G_k - G_j).
             Vecd dG = Vecd::Zero();
-            if (axisym)
+            if (j_weighted)
                 dG = J_i * g_i - (pos_[index_j][1] / r0) * grad_[index_j];
             else
                 dG = g_i - grad_[index_j];
@@ -1564,7 +1578,7 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
         // gradient of the discrete functional, scales as 1/R0, and vanishes in
         // the flat limit together with J -> 1.  Removing it while keeping the
         // energy would break energy-force consistency (the FD check fails).
-        if (axisym)
+        if (j_weighted)
             f += coeff * (0.5 / r0) * g_i.squaredNorm() * Vecd(0.0, 1.0);
         sg_force_[index_i] = f;
         force_[index_i] += f;
@@ -1586,7 +1600,8 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
     {
         const size_t total = particles_->TotalRealParticles();
         const bool axisym = Axisymmetric();
-        const Real r0 = axisym ? AxisRadius() : 1.0;
+        const bool j_weighted = axisym && !run_options.axisym_j_one;
+        const Real r0 = j_weighted ? AxisRadius() : 1.0;
         const Real coeff =
             -run_options.interface_lambda / run_options.interface_rho_ref;
         Real dmax = 0.0, fmax = 0.0;
@@ -1595,7 +1610,7 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
             Vecd f = Vecd::Zero();
             if (run_options.interface_lambda > 0.0)
             {
-                const Real Ji = axisym ? (pos_[i][1] / r0) : 1.0;
+                const Real Ji = j_weighted ? (pos_[i][1] / r0) : 1.0;
                 const Neighborhood &nb = inner_configuration_[i];
                 for (size_t n = 0; n != nb.current_size_; ++n)
                 {
@@ -1607,7 +1622,7 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
                         continue;
                     const Vecd e = nb.e_ij_[n];
                     Vecd dG = Vecd::Zero();
-                    if (axisym)
+                    if (j_weighted)
                         dG = Ji * grad_[i] -
                              (pos_[nb.j_[n]][1] / r0) * grad_[nb.j_[n]];
                     else
@@ -1616,7 +1631,7 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
                     f += coeff * (RhoKernelDDW(r) * dGe * e +
                                   (w1 / r) * (dG - dGe * e));
                 }
-                if (axisym)
+                if (j_weighted)
                     f += coeff * (0.5 / r0) * grad_[i].squaredNorm() *
                          Vecd(0.0, 1.0);
             }
@@ -1624,6 +1639,60 @@ class CGSquareGradientForce : public LocalDynamics, public DataDelegateInner
             fmax = std::max(fmax, sg_force_[i].norm());
         }
         return fmax > 0.0 ? dmax / fmax : 0.0;
+    }
+
+    /**
+     * N3 diagnostic: per-particle split of the square-gradient force into the
+     * J-weighted chain-rule part (1) and the explicit dJ/dr part (2).
+     * Read-only; only called when --sg-force-dump=1.
+     */
+    void DumpForceSplit(const std::string &path) const
+    {
+        std::ofstream csv(path);
+        csv << std::setprecision(17);
+        csv << "i,z,r,Fr_chain,Fr_explicit_J,Fr_total,Fz_total,Gz,Gr,grad2\n";
+        const size_t total = particles_->TotalRealParticles();
+        const bool j_weighted = Axisymmetric() && !run_options.axisym_j_one;
+        const Real r0 = j_weighted ? AxisRadius() : 1.0;
+        const Real coeff =
+            -run_options.interface_lambda / run_options.interface_rho_ref;
+        for (size_t i = 0; i != total; ++i)
+        {
+            Vecd fc = Vecd::Zero(), fe = Vecd::Zero();
+            if (run_options.interface_lambda > 0.0)
+            {
+                const Real Ji = j_weighted ? (pos_[i][1] / r0) : 1.0;
+                const Neighborhood &nb = inner_configuration_[i];
+                for (size_t n = 0; n != nb.current_size_; ++n)
+                {
+                    const Real r = nb.r_ij_[n];
+                    if (r <= TinyReal)
+                        continue;
+                    const Real w1 = RhoKernelDW(r);
+                    if (w1 == 0.0)
+                        continue;
+                    const Vecd e = nb.e_ij_[n];
+                    Vecd dG = Vecd::Zero();
+                    if (j_weighted)
+                        dG = Ji * grad_[i] -
+                             (pos_[nb.j_[n]][1] / r0) * grad_[nb.j_[n]];
+                    else
+                        dG = grad_[i] - grad_[nb.j_[n]];
+                    const Real dGe = dG.dot(e);
+                    fc += coeff * (RhoKernelDDW(r) * dGe * e +
+                                   (w1 / r) * (dG - dGe * e));
+                }
+                if (j_weighted)
+                    fe += coeff * (0.5 / r0) * grad_[i].squaredNorm() *
+                          Vecd(0.0, 1.0);
+            }
+            const Vecd ft = fc + fe;
+            csv << i << "," << pos_[i][0] << "," << pos_[i][1] << "," << fc[1]
+                << "," << fe[1] << "," << ft[1] << "," << ft[0] << ","
+                << grad_[i][0] << "," << grad_[i][1] << ","
+                << grad_[i].squaredNorm() << "\n";
+        }
+        csv.close();
     }
 
   private:
@@ -1831,7 +1900,11 @@ class CGLangevinOU : public LocalDynamics
     void exec(Real dt = 0.0)
     {
         const Real c1 = std::exp(-run_options.friction * dt);
-        const Real c2 = std::sqrt(run_options.temperature * (1.0 - c1 * c1));
+        // N3 diagnostic: --noise-off=1 removes the stochastic amplitude only
+        // (pure damping).  Default 0 keeps the FDT-consistent production value.
+        const Real c2 = run_options.noise_off
+                            ? 0.0
+                            : std::sqrt(run_options.temperature * (1.0 - c1 * c1));
         const size_t total = particles_->TotalRealParticles();
         for (size_t i = 0; i != total; ++i)
         {
@@ -2834,6 +2907,13 @@ static int RunCgCase(int ac, char *av[])
     wall_force.exec();
     sg_density.exec();
     sg_force.exec();
+
+    // N3 diagnostic: dump the term(1)/term(2) split once, at t = 0.
+    if (run_options.sg_force_dump != 0)
+    {
+        sg_force.DumpForceSplit("sg_force_split.csv");
+        std::cout << "  sg force split -> sg_force_split.csv\n";
+    }
 
     // M1.3 / N1 gate: evaluate the analytic force once, then compare it with
     // the finite-difference gradient of the same discrete energy.  Diagnostic
