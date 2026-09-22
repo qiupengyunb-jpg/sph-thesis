@@ -167,8 +167,24 @@ Real DomainLength() { return run_options.domain_length; }
 Real DomainHeight() { return run_options.domain_height; }
 Real FibreHalfWidth() { return run_options.fibre_half_width; }
 Real FibreCentreY() { return 0.5 * DomainHeight(); }
+
+// ---- M1.1 axisymmetric geometry (scaffold only) ---------------------------
+//  Coordinate interpretation in the axisymmetric branch:
+//      x -> z : axial coordinate, PERIODIC
+//      y -> r : radial coordinate measured from the fibre axis
+//  The fibre is R(z) = R0 = const and occupies r < R0, so the wall distance is
+//      h_wall = r - R0 = y - R0
+//  and the outward surface normal is ALWAYS +r.  Unlike the strip/capsule
+//  shapes there is no second side and no end cap.  M1.1 adds NO physics: this
+//  branch only supplies h and the normal to the pre-existing Morse wall force
+//  and to the pre-existing geometric constraint.
+inline bool Axisymmetric() { return run_options.axisymmetric != "off"; }
+Real AxisRadius() { return run_options.axis_radius; }
+
 Real FibreRadius()
 {
+    if (Axisymmetric())
+        return AxisRadius();
     return (run_options.fibre_shape == "cylinder") ? run_options.fibre_radius
                                                    : FibreHalfWidth();
 }
@@ -213,6 +229,14 @@ inline FibreContact FibreContactOf(const Vecd &p)
         c.normal = Vecd(0.0, 1.0);
         return c;
     }
+    if (Axisymmetric())
+    {
+        // Constant-radius cylinder: h is independent of z (no radius gradient,
+        // no end cap) and the normal is the radial unit vector, never -r.
+        c.h = p[1] - AxisRadius();
+        c.normal = Vecd(0.0, 1.0);
+        return c;
+    }
     if (run_options.fibre_shape == "cylinder")
     {
         const Real dx = PeriodicOffsetX(p[0]);
@@ -234,6 +258,9 @@ inline FibreContact FibreContactOf(const Vecd &p)
 /** Area occupied by the fibre (used only to convert area fraction to N). */
 Real FibreArea()
 {
+    // Axisymmetric cross-section (z,r): the solid core r < R0 covers R0 * Lz.
+    if (Axisymmetric())
+        return AxisRadius() * DomainLength();
     if (run_options.fibre_shape == "none")
         return 0.0;
     if (run_options.fibre_shape == "cylinder")
@@ -244,6 +271,9 @@ Real FibreArea()
 /** Perimeter that can be covered: the 2D "circumference" analogue. */
 Real FibrePerimeter()
 {
+    // Physical wetted circumference of the cylinder; informational only.
+    if (Axisymmetric())
+        return 2.0 * Pi * AxisRadius();
     if (run_options.fibre_shape == "cylinder")
         return 2.0 * FibreLength() + 2.0 * Pi * FibreRadius();
     return 2.0 * DomainLength();
@@ -693,20 +723,45 @@ void ParseCommandLine(int argc, char *argv[])
     if (run_options.init_mode != "scatter" && run_options.init_mode != "cluster" &&
         run_options.init_mode != "lattice")
         throw std::runtime_error("--init must be scatter, cluster or lattice.");
-    // M1.0 zero-path gate: the axisymmetric branch is scaffolded but NOT
-    // implemented.  Refusing every non-off value here is what makes the
-    // stage-1 bitwise regression meaningful: there is no reachable code that
-    // could perturb the legacy trajectory.
-    if (run_options.axisymmetric != "off")
-        throw std::runtime_error(
-            "--axisymmetric=" + run_options.axisymmetric +
-            " is not implemented yet (M1.0 scaffold only); use --axisymmetric=off.");
+    if (run_options.axisymmetric != "off" && run_options.axisymmetric != "filmonly")
+        throw std::runtime_error("--axisymmetric must be off or filmonly.");
     if (run_options.axis_radius <= 0.0)
         throw std::runtime_error("--fibre-radius-const must be positive.");
     if (run_options.film_thickness <= 0.0)
         throw std::runtime_error("--film-thickness must be positive.");
     if (run_options.film_perturb_mode < 1)
         throw std::runtime_error("--film-perturb-mode must be at least 1.");
+    if (Axisymmetric())
+    {
+        // The (z,r) cylinder is R = R0 = const by definition.  A capsule
+        // (--fibre-shape=cylinder) or a fibre-less run would silently replace it
+        // with a different geometry, so both are refused rather than ignored.
+        // "strip" is the RunOptions default and is simply superseded.
+        if (run_options.fibre_shape == "cylinder")
+            throw std::runtime_error(
+                "--fibre-shape=cylinder (capsule, finite end caps) is not "
+                "allowed with --axisymmetric; the (z,r) cylinder is R(z) = R0.");
+        if (run_options.fibre_shape == "none")
+            throw std::runtime_error(
+                "--axisymmetric=filmonly requires a fibre; --fibre-shape=none "
+                "would remove the wall entirely.");
+        if (run_options.axis_radius < 2.0 * Sigma())
+            throw std::runtime_error(
+                "--fibre-radius-const is below 2 sigma; the work order fixes "
+                "R0 = 5 sigma for M1.1 (kernel deficiency is deferred).");
+        if (run_options.film_perturb_amp != 0.0)
+            throw std::runtime_error(
+                "--film-perturb-amp is not implemented yet (M1.2); M1.1 runs an "
+                "unperturbed configuration only.");
+        if (run_options.axisym_jacobian)
+            throw std::runtime_error(
+                "--axisym-jacobian is not implemented yet (M2); the measure term "
+                "is deliberately absent in M1.1.");
+        if (ExclusionRadius() + 4.0 * Sigma() >= DomainHeight())
+            throw std::runtime_error(
+                "axisymmetric geometry leaves no radial room: need "
+                "R0 + exclusion_margin + 4 sigma < --domain-height.");
+    }
     if (run_options.init_mode == "cluster")
     {
         if (run_options.cluster_count < 8)
@@ -787,6 +842,19 @@ class FibreStripShape : public ComplexShape
   public:
     explicit FibreStripShape(const std::string &shape_name) : ComplexShape(shape_name)
     {
+        if (Axisymmetric())
+        {
+            // M1.1: the solid core r < R0, i.e. the band y in [0, R0] over the
+            // full axial period.  This is the (z,r) image of an infinite
+            // constant-radius cylinder.  It is NOT a capsule (no end caps), NOT
+            // a disc cross-section and NOT the centred strip.  The fibre body
+            // carries no interaction (only particles_inner exists), so this
+            // shape affects the written Fibre VTP only, never the trajectory.
+            const Vecd centre(0.5 * DomainLength(), 0.5 * AxisRadius());
+            const Vecd half(0.5 * DomainLength(), 0.5 * AxisRadius());
+            add<GeometricShapeBox>(Transform(centre), half);
+            return;
+        }
         if (run_options.fibre_shape == "cylinder")
         {
             // capsule = straight segment of length fibre_length plus two caps
@@ -1015,17 +1083,29 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
         const Real row = 0.5 * std::sqrt(3.0) * d;
         const int ny = std::max(2, static_cast<int>(std::floor(DomainHeight() / row)));
         const Real y0 = 0.5 * (DomainHeight() - (ny - 1) * row);
+        size_t added = 0;
         for (int j = 0; j < ny; ++j)
             for (int i = 0; i < nx; ++i)
             {
                 const Real x = (static_cast<Real>(i) + ((j % 2) ? 0.5 : 0.0)) * d;
                 const Real y = y0 + static_cast<Real>(j) * row;
+                // M1.1: in (z,r) the solid core r < R0 is NOT part of the fluid
+                // domain, so lattice sites that fall inside it must be dropped.
+                // Without this the run starts with particles inside the solid
+                // (h < 0), the geometric constraint projects them onto the
+                // surface in one step and the configuration blows up.
+                // The filter is deliberately gated on Axisymmetric() so that
+                // the legacy 2D lattice runs stay bit-identical.
+                if (Axisymmetric() &&
+                    FibreContactOf(Vecd(x, y)).h < run_options.exclusion_margin)
+                    continue;
                 addPositionAndVolumetricMeasure(Vecd(x, y), 1.0);
+                ++added;
             }
-        const Real packing = static_cast<Real>(nx * ny) * 0.25 * Pi * sigma * sigma /
+        const Real packing = static_cast<Real>(added) * 0.25 * Pi * sigma * sigma /
                              (DomainLength() * DomainHeight());
         std::cout << "  uniform lattice: nx=" << nx << " ny=" << ny
-                  << " N=" << nx * ny << " d=" << d << " row=" << row
+                  << " N=" << added << " d=" << d << " row=" << row
                   << " packing=" << packing
                   << " rho=" << packing / (0.25 * Pi * sigma * sigma) << "\n";
     }
@@ -1286,7 +1366,22 @@ class CGConstraints : public LocalDynamics
 
             if (run_options.y_reflect)
             {
-                if (pos_[i][1] < 0.0)
+                if (Axisymmetric())
+                {
+                    // In (z,r) the lower end of the y axis is the fibre CORE,
+                    // not a symmetry plane: reflecting there would push
+                    // particles back to r > 0, i.e. inside the solid.  The
+                    // r >= R0 side is enforced solely by the pre-existing
+                    // geometric constraint through h_wall = r - R0.  Only the
+                    // outer radial boundary stays reflecting (a confining
+                    // scaffold boundary, to be revisited in M1.2).
+                    if (pos_[i][1] > ly)
+                    {
+                        pos_[i][1] = 2.0 * ly - pos_[i][1];
+                        vel_[i][1] = -std::abs(vel_[i][1]);
+                    }
+                }
+                else if (pos_[i][1] < 0.0)
                 {
                     pos_[i][1] = -pos_[i][1];
                     vel_[i][1] = std::abs(vel_[i][1]);
@@ -1607,7 +1702,10 @@ static int RunCgCase(int ac, char *av[])
               << " k_BT=" << run_options.temperature
               << " gamma=" << run_options.friction << "\n"
               << "  axisymmetric mode=" << run_options.axisymmetric
-              << " (M1.0 scaffold; off = legacy 2D path, bit-identical)\n"
+              << (Axisymmetric() ? " -> (z,r) cylinder R(z)=R0 const,"
+                                   " h_wall = r - R0, z periodic"
+                                 : " -> legacy 2D (x,y) path, bit-identical")
+              << "\n"
               << "  domain=" << DomainLength() << " x " << DomainHeight()
               << " (periodic in x) fibre_half_width=" << FibreHalfWidth() << "\n"
               << "  area_fraction=" << run_options.area_fraction
@@ -1650,6 +1748,53 @@ static int RunCgCase(int ac, char *av[])
                   << "  (F_sg = (lambda/2) Sum_i V0 |grad rho_i|^2, Wendland C2 kernel)\n";
     else
         std::cout << "  A-1 square gradient: lambda=0 (disabled, true zero path)\n";
+
+    //-------------------------------------------------------------------------
+    //  M1.1 geometry / scaffold validation.  Pure geometry probe: it evaluates
+    //  h_wall and the wall-force direction at prescribed radii BEFORE any
+    //  dynamics, and writes them to a file.  It touches no particle state.
+    //-------------------------------------------------------------------------
+    if (Axisymmetric())
+    {
+        std::ofstream geo("axisym_geometry_selfcheck.csv");
+        geo << std::setprecision(10);
+        geo << "quantity,value,expected,note\n";
+        auto grow = [&](const std::string &k, Real v, const std::string &e,
+                        const char *n) { geo << k << "," << v << "," << e << "," << n << "\n"; };
+
+        grow("mode", 0.0, "filmonly", "axisymmetric branch active");
+        grow("R0", AxisRadius(), "constant", "R(z) = R0; no gradient, no end cap");
+        grow("Lz", DomainLength(), "periodic", "axial period");
+        grow("r_outer", DomainHeight(), "reflecting",
+             "outer radial boundary is scaffold confinement (M1.2 to revisit)");
+        grow("wall_re", WallRe(), "0.5", "Morse-wall well position = contact");
+        grow("wall_cutoff", WallCutoff(), "2.5", "wall force is zero beyond this h");
+
+        // Required probes from the work order, plus three extra radii that make
+        // the FORCE SIGN test non-trivial (0.5 and 2.5 are both force zeros).
+        const Real probes[6] = {-0.5, 0.25, 0.5, 0.75, 1.0, 2.5};
+        for (int k = 0; k < 6; ++k)
+        {
+            const Real dr = probes[k];
+            const Vecd p(0.5 * DomainLength(), AxisRadius() + dr);
+            const FibreContact c = FibreContactOf(p);
+            const Vecd f = c.normal * WallForce(c.h);
+            const std::string tag = "r=R0" + std::string(dr < 0.0 ? "-" : "+") +
+                                    std::to_string(std::abs(dr));
+            grow("h_wall[" + tag + "]", c.h, std::to_string(dr), "h_wall must equal r - R0");
+            grow("normal_z[" + tag + "]", c.normal[0], "0", "no axial component of the normal");
+            grow("normal_r[" + tag + "]", c.normal[1], "1", "outward +r, never -r");
+            grow("force_r[" + tag + "]", f[1],
+                 dr < 0.0    ? ">0 repulsive"
+                 : dr < 0.5  ? ">0 repulsive (inside the well minimum)"
+                 : dr == 0.5 ? "=0 at the well minimum"
+                 : dr < 2.5  ? "<0 attractive (toward the cylinder)"
+                             : "=0 at the wall cutoff",
+                 "WallForce sign convention: + means push away from the fibre");
+        }
+        geo.close();
+        std::cout << "  axisym selfcheck -> axisym_geometry_selfcheck.csv\n";
+    }
 
     //-------------------------------------------------------------------------
     //  Bodies
@@ -1716,9 +1861,10 @@ static int RunCgCase(int ac, char *av[])
         row("noise_key", "seed + OriginalID + timestep + component",
             "counter-based SplitMix64; independent of thread schedule");
         row("axisymmetric", run_options.axisymmetric,
-            "off = legacy 2D (z,r) path; filmonly reserved for M1.1+");
+            "off = legacy 2D (x,y); filmonly = (z,r) cylinder R=R0 const "
+            "(geometry scaffold only: no 2 pi r weighting, no measure term)");
         row("axis_radius_const", std::to_string(run_options.axis_radius),
-            "R0/sigma, constant-radius fibre; placeholder until M1.1");
+            "R0/sigma, constant-radius (z,r) cylinder; active when axisymmetric!=off");
         row("film_thickness", std::to_string(run_options.film_thickness),
             "h0/sigma, uniform annular film; placeholder until M1.2");
         row("film_perturb_amp", std::to_string(run_options.film_perturb_amp),
