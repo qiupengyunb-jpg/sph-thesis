@@ -39,7 +39,13 @@ def prod_fields(z, r, h, Lz, i=None, zi=None, ri=None):
         dz=zz-zz[k]; dz-=Lz*np.round(dz/Lz); dr=rr-rr[k]
         s=np.sqrt(dz*dz+dr*dr); m=(s>0)&(s<h)
         if not np.any(m): continue
-        ss=s[m]; ez=dz[m]/ss; er=dr[m]/ss
+        # IMPORTANT: production e_ij = (x_i - x_j)/s.  The vectors below are
+        # built as (x_j - x_i)/s, i.e. the NEGATIVE of the production convention;
+        # the gradient reported here is therefore already the physical grad rho
+        # once the minus sign is applied.  See the correction note in the N2.3
+        # report: an earlier revision of this file omitted that minus and
+        # produced a spurious Q ~ -1.
+        ss=s[m]; ez=-dz[m]/ss; er=-dr[m]/ss
         rho[k]=float(np.sum(W(ss,h)))
         gz[k]=float(np.sum(dW(ss,h)*ez))
         gr[k]=float(np.sum(dW(ss,h)*er))
