@@ -1,0 +1,2 @@
+label,t_start,t_end,n_frames,mean_h_start,mean_h_end,relax_drop,relax_time,ripple_after,noise_floor_mean,noise_floor_max,noise_floor_dominant_m,pseudo_omega_max,pseudo_omega_argm,noise_floor_M1_12
+phi0.68,0.0,50.0,101,1.5001284929999998,1.329019722284375,0.1711087707156249,3.0,0.16649208496409976,0.056048256092355885,0.0815016877758498,7,15.463843889244721,7,1:0.0367;2:0.0630;3:0.0649;4:0.0543;5:0.0806;6:0.0702;7:0.0815;8:0.0211;9:0.0409;10:0.0762;11:0.0466;12:0.0365
