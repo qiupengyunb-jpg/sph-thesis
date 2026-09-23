@@ -23,6 +23,14 @@
 等半径 axisymmetric cylinder + Scheme E；WCA / Morse pp / Morse wall / BAOAB+OU / m=1 全不动。
 **T = 1**（Stage 1 允许直接有限温；T=0 会冻结，只作机制背景）。
 
+### 2b. 必须显式给出的三个 CLI 参数（Stage 2 检查后补，见 `Stage2_precheck_report.md`）
+
+| 参数 | 值 | 原因 |
+|---|---|---|
+| `--cluster-packing=` | **0.63**（代码默认；**必须显式写**，避免与早期文档的 0.70 混淆） | film 初态的**面内堆积率**复用该字段；它决定 `d` 与 `dr`，从而决定 realised thickness 的层数 |
+| `--domain-height=` | R0=5→40、R0=10→40、**R0=20→60**（规则：`H ≥ R0 + 0.5 + h_film + 2.1 + 2.0`） | 旧判据 `2(R0+margin) < H` 是**二维条带语义**，对轴对称几何**过严**；默认 40 会让 R0=20 误报 `fibre does not fit inside the domain` |
+| `--domain-length=` | = Lz（Stage 2 建议 **120**） | 决定可容纳的珠数与 spacing 统计样本数 |
+
 ## 3. 两类初态
 
 | 初态 | 命令 | 说明 |

@@ -163,6 +163,9 @@ def main():
         w.writeheader()
         w.writerow(summ)
     for k in ("method", "n_frames", "t_window", "modal_class", "class_fractions",
+              "t_first_bead_ge2", "t_first_bead_ge4", "merge_events", "max_bead_count",
+              "bead4_hold_time", "largest_fraction_slope", "CV_spacing_slope",
+              "mean_spacing_slope",
               "median_bead_count", "median_CV_spacing", "median_largest_fraction",
               "median_modulation", "median_dominant_lambda", "lambda_drift",
               "max_F3_hold_time", "periodic_structure"):
@@ -178,6 +181,40 @@ def summarize(rows, a):
             continue
         cls = [r["class"] for r in rr]
         t = np.array([r["time"] for r in rr])
+        bc = np.array([r["bead_count"] for r in rr], float)
+        lf = np.array([r["largest_fraction"] for r in rr], float)
+        sp = np.array([r["CV_spacing"] for r in rr], float)
+        msp = np.array([r["mean_spacing"] for r in rr], float)
+
+        def first_time(cond):
+            idx = np.where(cond)[0]
+            return float(t[idx[0]]) if idx.size else float("nan")
+
+        def slope(y):
+            ok = np.isfinite(y)
+            if ok.sum() < 3 or t[ok].ptp() <= 0:
+                return float("nan")
+            return float(np.polyfit(t[ok], y[ok], 1)[0])
+
+        out["t_first_bead_ge2"] = first_time(bc >= 2)
+        out["t_first_bead_ge4"] = first_time(bc >= 4)
+        # bead-merge events: frames where the bead count DROPS
+        out["merge_events"] = int(np.sum(np.diff(bc) <= -1))
+        out["max_bead_count"] = float(np.max(bc))
+        # longest contiguous time with bead_count >= 4
+        best4 = run4 = 0.0
+        prev = None
+        for c, tt in zip(bc >= 4, t):
+            if c:
+                run4 += (tt - prev if prev is not None else 0.0)
+                best4 = max(best4, run4)
+            else:
+                run4 = 0.0
+            prev = tt
+        out["bead4_hold_time"] = best4
+        out["largest_fraction_slope"] = slope(lf)
+        out["CV_spacing_slope"] = slope(sp)
+        out["mean_spacing_slope"] = slope(msp)
         out["method"] = tag
         out["n_frames"] = len(rr)
         out["t_window"] = "%.1f..%.1f" % (t.min(), t.max())
