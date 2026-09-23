@@ -145,6 +145,7 @@ struct RunOptions
     Real film_thickness = 2.5;        /**< h0 / sigma, uniform annular film */
     Real film_perturb_amp = 0.0;      /**< A / sigma, 0 = no axial modulation */
     int film_perturb_mode = 1;        /**< n in A sin(2 pi n z / Lz) */
+    bool film_broadband = false;      /**< Stage 1: broadband axial seed */
     bool axisym_jacobian = false;     /**< explicit -kBT ln(2 pi r) measure */
     int sg_fd_check = 0; /**< M1.3/N1: run the energy-force FD check and exit */
     // ---- N3 diagnostic-only switches (all default OFF; none changes the
@@ -666,6 +667,8 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.film_perturb_amp = ToReal(a, "--film-perturb-amp=");
         else if (StartsWith(a, "--film-perturb-mode="))
             run_options.film_perturb_mode = ToInt(a, "--film-perturb-mode=");
+        else if (StartsWith(a, "--film-broadband="))
+            run_options.film_broadband = ToInt(a, "--film-broadband=") != 0;
         else if (StartsWith(a, "--axisym-jacobian="))
             run_options.axisym_jacobian = ToInt(a, "--axisym-jacobian=") != 0;
         else if (StartsWith(a, "--sg-fd-check="))
@@ -913,6 +916,27 @@ void ParseCommandLine(int argc, char *argv[])
 //=============================================================================
 //  Geometry
 //=============================================================================
+/** Stage 1 broadband axial seed.
+ *
+ *  Modes 1,2,3,4,5,6,8,10 with golden-ratio phases and strictly equal weights;
+ *  --film-perturb-amp is then the TOTAL amplitude budget, i.e. |f - 1| <= A
+ *  pointwise, so the WCA-overlap margin is the same as for the single-mode
+ *  seed of the same A.  No wavelength is favoured (equal weights, spread
+ *  phases); the realised spectrum is verified from frame 0 by m15_beads.py.
+ */
+inline Real FilmBroadbandFactor(const Real z, const Real lz, const Real amp)
+{
+    static const int modes[] = {1, 2, 3, 4, 5, 6, 8, 10};
+    static const int nm = 8;
+    Real s = 0.0;
+    for (int k = 0; k < nm; ++k)
+    {
+        const Real phi = 2.0 * Pi * std::fmod(modes[k] * 0.6180339887498949, 1.0);
+        s += std::sin(2.0 * Pi * static_cast<Real>(modes[k]) * z / lz + phi);
+    }
+    return 1.0 + (amp / static_cast<Real>(nm)) * s;
+}
+
 class CGDomainShape : public ComplexShape
 {
   public:
@@ -1297,8 +1321,11 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
             {
                 Real z = shift + static_cast<Real>(k) * dz;
                 z -= lz * std::floor(z / lz);
-                const Real f =
-                    (pert_amp != 0.0) ? (1.0 + pert_amp * std::sin(pert_kz * z)) : 1.0;
+                const Real f = (pert_amp == 0.0)
+                                   ? 1.0
+                                   : (run_options.film_broadband
+                                          ? FilmBroadbandFactor(z, lz, pert_amp)
+                                          : 1.0 + pert_amp * std::sin(pert_kz * z));
                 const Real r = radius + h + (h - h_in) * (f - 1.0);
                 const Vecd p(z, r);
                 addPositionAndVolumetricMeasure(p, 1.0);
