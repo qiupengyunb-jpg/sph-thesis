@@ -41,21 +41,24 @@ DOM_LAMBDA_DRIFT_MAX = 0.25  # dominant wavelength drift over the window
 
 
 def find_peaks_periodic(h, min_dist_bins, prominence):
-    """Local maxima with prominence, periodic in the array."""
+    """Topographic peaks with prominence, periodic in the array.
+
+    Uses scipy.signal.find_peaks(mode="wrap") so that "prominence" means the
+    standard topographic prominence (height above the higher of the two
+    surrounding troughs) instead of the second-difference proxy that an
+    immediate-neighbour rule produces.  The earlier proxy preferentially
+    detected single-bin spikes, which is exactly the flicker source found in
+    the Stage-2 pre-check.
+    """
+    from scipy.signal import find_peaks
+    h = np.asarray(h, float)
     n = h.size
-    idx = [i for i in range(n)
-           if h[i] > h[(i - 1) % n] and h[i] >= h[(i + 1) % n] and h[i] > 0]
-    kept = []
-    for i in sorted(idx, key=lambda k: -h[k]):
-        if all(min(abs(i - j), n - abs(i - j)) >= min_dist_bins for j in kept):
-            kept.append(i)
-    out = []
-    for i in sorted(kept):
-        # prominence relative to the ridge between this peak and its neighbours
-        lo = max(0.0, min(h[(i - 1) % n], h[(i + 1) % n]))
-        if h[i] - lo >= prominence:
-            out.append(i)
-    return out
+    pad = int(max(2, min_dist_bins))
+    ext = np.concatenate([h[-pad:], h, h[:pad]])
+    idx, _props = find_peaks(ext, distance=max(1, int(min_dist_bins)),
+                             prominence=prominence)
+    keep = sorted({int(i) - pad for i in idx if 0 <= int(i) - pad < n})
+    return [i for i in keep if h[i] > 0]
 
 
 def frame_metrics(h, z_grid, R0, Lz, mmax=12, min_dist_sigma=2.0):
