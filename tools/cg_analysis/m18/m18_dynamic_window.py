@@ -36,7 +36,7 @@ R2_MIN = 0.80
 MIN_POINTS = 8
 
 
-def series(run_dir, R0, Lz, nbins):
+def series(run_dir, R0, Lz, nbins, tau_offset=0.0, tau_min=-1e9):
     files = M.frame_list(run_dir)
     times = M.frame_times(run_dir, files)
     out = []
@@ -44,7 +44,9 @@ def series(run_dir, R0, Lz, nbins):
         _t, z, r = M.read_vtp(f)
         h = R.method_D(z, r, R0, Lz, nbins)
         A = M.fourier_project(h - np.nanmean(h), Lz, MMAX)
-        rec = dict(time=float(tf), mean_h=float(np.nanmean(h)))
+        if float(tf) - tau_offset < tau_min:
+            continue
+        rec = dict(time=float(tf) - tau_offset, mean_h=float(np.nanmean(h)))
         for m in range(1, MMAX + 1):
             rec["A%d" % m] = A[m]
         out.append(rec)
@@ -96,10 +98,13 @@ def main():
     ap.add_argument("--R0", type=float, default=5.0)
     ap.add_argument("--Lz", type=float, default=160.0)
     ap.add_argument("--nbins", type=int, default=320)
+    ap.add_argument("--tau-min", type=float, default=-1e9)
+    ap.add_argument("--tau-offset", type=float, default=0.0,
+                    help="Stage 9: tau = t - t_injection")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    ctrl = series(a.ctrl, a.R0, a.Lz, a.nbins)
+    ctrl = series(a.ctrl, a.R0, a.Lz, a.nbins, a.tau_offset, a.tau_min)
     tc = np.array([x["time"] for x in ctrl])
 
     rows, growth = [], []
@@ -108,7 +113,7 @@ def main():
         label, d = spec.split("=", 1)
         cases[label] = (d, int(label[1:]))
     for label, (d, m) in cases.items():
-        s = series(d, a.R0, a.Lz, a.nbins)
+        s = series(d, a.R0, a.Lz, a.nbins, a.tau_offset, a.tau_min)
         t = np.array([x["time"] for x in s])
         ai = np.array([x["A%d" % m] for x in s])
         ac = np.array([x["A%d" % m] for x in ctrl])
