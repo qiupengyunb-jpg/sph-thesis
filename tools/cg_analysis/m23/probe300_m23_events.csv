@@ -1,0 +1,2 @@
+label,t_end,n_frames,t_mod,t_bead2,t_bead4,N_max,t_Nmax,t_coarsen,t_dominant,bead_density_max,P_low_end,P_low_mean,T_F2,dynamics_class,dynamics_reason,coarsen_rate_N,L_spec_slope
+probe300_legacy,300.0,1502,15.2025,1.2,5.805,11.0,41.0025,41.0025,0.405,0.06875,8.47910650745399,3.023793881528475,72.30359520639148,D2,"active coarsening (rate=0.0270, dLF=4.39e-04)",0.02702728790818444,0.003979165304830817
