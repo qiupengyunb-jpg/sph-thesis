@@ -150,6 +150,7 @@ struct RunOptions
     // ---- N3 diagnostic-only switches (all default OFF; none changes the
     //      production trajectory when left at its default) ------------------
     int sg_force_dump = 0;    /**< dump per-particle term(1)/term(2) force split */
+    int sg_budget_every = 0;  /**< M1.4: write sg_budget.csv every N steps (0=off) */
     bool noise_off = false;   /**< T = 0 diagnostic: zero the OU noise amplitude */
     bool axisym_j_one = false;/**< force J = 1 in the (z,r) branch (J control) */
     // ---- M1.3R experimental interface-energy schemes (default = production) --
@@ -671,6 +672,8 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.sg_fd_check = ToInt(a, "--sg-fd-check=");
         else if (StartsWith(a, "--sg-force-dump="))
             run_options.sg_force_dump = ToInt(a, "--sg-force-dump=");
+        else if (StartsWith(a, "--sg-budget-every="))
+            run_options.sg_budget_every = ToInt(a, "--sg-budget-every=");
         else if (StartsWith(a, "--noise-off="))
             run_options.noise_off = ToInt(a, "--noise-off=") != 0;
         else if (StartsWith(a, "--axisym-j-one="))
@@ -795,10 +798,16 @@ void ParseCommandLine(int argc, char *argv[])
             throw std::runtime_error(
                 "--fibre-radius-const is below 2 sigma; the work order fixes "
                 "R0 = 5 sigma for M1.1 (kernel deficiency is deferred).");
-        if (run_options.film_perturb_amp != 0.0)
+        // M1.4 C1: the film-thickness perturbation is implemented as a
+        // continuous radial coordinate mapping (see prepareAxisymmetricFilm).
+        // A = 0 is an exact return to the M1.2 state; |A| is limited to a
+        // genuinely small-amplitude window.
+        if (std::abs(run_options.film_perturb_amp) > 0.2)
             throw std::runtime_error(
-                "--film-perturb-amp is not implemented yet (M1.2); M1.1 runs an "
-                "unperturbed configuration only.");
+                "--film-perturb-amp must satisfy |A| <= 0.2 (small-amplitude "
+                "axial perturbation only).");
+        if (run_options.film_perturb_mode < 1)
+            throw std::runtime_error("--film-perturb-mode must be at least 1.");
         if (run_options.axisym_jacobian)
             throw std::runtime_error(
                 "--axisym-jacobian is not implemented yet (M2); the measure term "
@@ -1259,17 +1268,38 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
         int rows = 0;
         Real h_first = 0.0;
         Real h_last = 0.0;
+        // M1.4 C1: the layer count (hence the outer layer height) is known
+        // before placement, so the continuous thickness perturbation can be
+        // applied to the actual particle positions as they are created.  With
+        // A = 0 the factor is exactly 1 and the (h - h_in)*(f - 1) term is
+        // exactly zero, so the M1.2 configuration is reproduced bit for bit.
+        int rows_planned = 0;
+        for (int layer = 0;; ++layer)
+        {
+            if (h_in + static_cast<Real>(layer) * dr > h_out + 1.0e-9)
+                break;
+            ++rows_planned;
+        }
+        const Real h_out_layer =
+            h_in + static_cast<Real>(std::max(rows_planned - 1, 0)) * dr;
+        const Real pert_amp = run_options.film_perturb_amp;
+        const Real pert_kz = (pert_amp != 0.0)
+                                 ? 2.0 * Pi *
+                                       static_cast<Real>(run_options.film_perturb_mode) / lz
+                                 : 0.0;
         for (int layer = 0;; ++layer)
         {
             const Real h = h_in + static_cast<Real>(layer) * dr;
             if (h > h_out + 1.0e-9)
                 break;
-            const Real r = radius + h;
             const Real shift = ((layer % 2) ? 0.5 : 0.0) * dz;
             for (int k = 0; k < n; ++k)
             {
                 Real z = shift + static_cast<Real>(k) * dz;
                 z -= lz * std::floor(z / lz);
+                const Real f =
+                    (pert_amp != 0.0) ? (1.0 + pert_amp * std::sin(pert_kz * z)) : 1.0;
+                const Real r = radius + h + (h - h_in) * (f - 1.0);
                 const Vecd p(z, r);
                 addPositionAndVolumetricMeasure(p, 1.0);
                 placed.push_back(p);
@@ -1277,7 +1307,7 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
             if (rows == 0)
                 h_first = h;
             h_last = h;
-            layer_r.push_back(r);
+            layer_r.push_back(radius + h);   // unperturbed layer radius
             layer_n.push_back(n);
             ++rows;
         }
@@ -1285,6 +1315,39 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
             throw std::runtime_error(
                 "--init=film produced no particles; check --film-thickness, the "
                 "fibre geometry and the domain size.");
+
+        //-------------------------------------------------------------------------
+        //  M1.4 C1: continuous axial film-thickness perturbation
+        //
+        //      s  = r - R0                        height above the fibre surface
+        //      s' = s + (s - s_in) (f - 1),
+        //      f  = 1 + A sin(2 pi m z / Lz)
+        //
+        //  Properties: A = 0 returns the M1.2 state exactly (the loop is skipped
+        //  entirely, so the trajectory stays bit-identical); the innermost layer
+        //  sits at s = s_in and does not move; the outer interface carries the
+        //  full amplitude; f > 0 for |A| <= 0.2 so each particle keeps its layer
+        //  index and the layer topology is unchanged; <f> over one axial period
+        //  is exactly 1, so the m = 0 thickness is unchanged and the volume
+        //  excess is only the O(A^2) term reported below.
+        //-------------------------------------------------------------------------
+        Real perturb_volume_rel_excess = 0.0;
+        if (pert_amp != 0.0)
+        {
+            const Real mode_m = static_cast<Real>(run_options.film_perturb_mode);
+            const Real ds = h_out_layer - h_in;
+            const Real r_in = radius + h_in;
+            perturb_volume_rel_excess =
+                (0.5 * ds * ds * pert_amp * pert_amp) /
+                (2.0 * r_in * ds + ds * ds);
+            std::cout << "  film perturbation: A=" << pert_amp
+                      << " mode m=" << run_options.film_perturb_mode
+                      << " kz=" << pert_kz
+                      << " lambda_z=" << (lz / mode_m)
+                      << " outer_layer_h=" << h_out_layer
+                      << " volume_rel_excess_O(A^2)=" << perturb_volume_rel_excess
+                      << "\n";
+        }
 
         // Realised geometry.  Every layer stands for one dr-thick band, so the
         // built band is rows*dr thick and holds exactly the requested packing.
@@ -1349,6 +1412,12 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
             "rows*dr; USE THIS ONE for any downstream geometry comparison");
         row("realised_minus_requested", std::to_string(realised_thickness - h_out),
             "quantisation of the film thickness by dr");
+        row("perturb_amp", std::to_string(run_options.film_perturb_amp),
+            "M1.4 C1: A in s' = s + (s - s_in)(A sin(2 pi m z / Lz)); 0 = M1.2 state");
+        row("perturb_mode", std::to_string(run_options.film_perturb_mode),
+            "axial mode index m; lambda_z = Lz / m");
+        row("perturb_volume_rel_excess", std::to_string(perturb_volume_rel_excess),
+            "analytic O(A^2) relative volume excess of the mapped band");
         row("radial_rows", std::to_string(rows), "number of radial layers");
         row("particle_count", std::to_string(kept), "N = rows*n, never hand-set");
         row("min_wall_distance", std::to_string(min_wall_distance),
@@ -1763,6 +1832,23 @@ inline Real SGDifferencePairPref()
     return 0.5 * run_options.interface_lambda * V0 * V0 * ck;
 }
 
+/** Pair measure factor J_ij.  --axisym-j-one=1 gives the MATHEMATICALLY
+ *  CORRESPONDING planar control: the same Scheme E functional with J = 1,
+ *  i.e. (lambda/2) V0^2 Sum (rho_i - rho_j)^2 Kt_ij.  Only the interface
+ *  measure is changed; nothing else. */
+inline Real SGDifferenceJ(const Real ri, const Real rj)
+{
+    if (run_options.axisym_j_one)
+        return 1.0;
+    return 0.5 * (ri + rj) / AxisRadius();
+}
+
+/** d J_ij / d r_i; zero in the J = 1 control (no radial measure branch). */
+inline Real SGDifferenceDJdr()
+{
+    return run_options.axisym_j_one ? 0.0 : 0.5 / AxisRadius();
+}
+
 /** Sweep 2 of Scheme E: conjugate field  S_i = Sum_j 2 A_ij (rho_i - rho_j). */
 class CGSquareGradientConjugate : public LocalDynamics, public DataDelegateInner
 {
@@ -1795,7 +1881,7 @@ class CGSquareGradientConjugate : public LocalDynamics, public DataDelegateInner
             const Real w = RhoKernelW(r);
             if (w <= 0.0)
                 continue;
-            const Real Jij = 0.5 * (ri + pos_[index_j][1]) / r0;
+            const Real Jij = SGDifferenceJ(ri, pos_[index_j][1]);
             s += 2.0 * pref * Jij * w * (rho_[index_i] - rho_[index_j]);
         }
         conj_[index_i] = s;
@@ -1850,13 +1936,13 @@ class CGSquareGradientDifferenceForce : public LocalDynamics,
             if (w <= 0.0 && dw == 0.0)
                 continue;
             const Vecd e = neighborhood.e_ij_[n];
-            const Real Jij = 0.5 * (ri + pos_[index_j][1]) / r0;
+            const Real Jij = SGDifferenceJ(ri, pos_[index_j][1]);
             // (1) neighbour part of the density chain rule
             f -= conj_[index_j] * dw * e;
             // (2) explicit d(measure)/dx and dW/dx branches, gated by (d rho)^2
             const Real drho = rho_i - rho_[index_j];
             f -= (drho * drho) * pref *
-                 ((0.5 / r0) * w * radial_hat + Jij * dw * e);
+                 (SGDifferenceDJdr() * w * radial_hat + Jij * dw * e);
             ++nterm;
         }
         if (count_terms != nullptr)
@@ -1915,11 +2001,11 @@ class CGSquareGradientDifferenceForce : public LocalDynamics,
                     const Real w = RhoKernelW(r), dw = RhoKernelDW(r);
                     if (w <= 0.0 && dw == 0.0)
                         continue;
-                    const Real Jij = 0.5 * (ri + pos_[j][1]) / r0;
+                    const Real Jij = SGDifferenceJ(ri, pos_[j][1]);
                     fc -= conj_[j] * dw * e;
                     const Real drho = rho_i - rho_[j];
                     fe -= (drho * drho) * pref *
-                          ((0.5 / r0) * w * Vecd(0.0, 1.0) + Jij * dw * e);
+                          (SGDifferenceDJdr() * w * Vecd(0.0, 1.0) + Jij * dw * e);
                 }
             }
             const Vecd ft = fc + fe;
@@ -2443,7 +2529,7 @@ Real SGDifferenceConfigEnergy(const std::vector<Vecd> &p)
             const Real r = d.norm();
             if (r <= TinyReal || r >= h)
                 continue;
-            const Real Jij = 0.5 * (p[i][1] + p[j][1]) / r0;
+            const Real Jij = SGDifferenceJ(p[i][1], p[j][1]);
             const Real drho = rho[i] - rho[j];
             acc += Jij * SGDifferenceW(r) * drho * drho;
         }
@@ -2486,7 +2572,7 @@ void SGDifferenceConfigForce(const std::vector<Vecd> &p, bool include_explicit,
             const Real r = d.norm();
             if (r <= TinyReal || r >= h)
                 continue;
-            const Real Jij = 0.5 * (p[i][1] + p[j][1]) / r0;
+            const Real Jij = SGDifferenceJ(p[i][1], p[j][1]);
             S[i] += 2.0 * pref * Jij * SGDifferenceW(r) * (rho[i] - rho[j]);
         }
     F.assign(n, Vecd::Zero());
@@ -2507,9 +2593,9 @@ void SGDifferenceConfigForce(const std::vector<Vecd> &p, bool include_explicit,
             F[i] -= S[j] * RhoKernelDW(r) * e;
             if (include_explicit)
             {
-                const Real Jij = 0.5 * (p[i][1] + p[j][1]) / r0;
+                const Real Jij = SGDifferenceJ(p[i][1], p[j][1]);
                 F[i] -= drho * drho * pref *
-                        ((0.5 / r0) * SGDifferenceW(r) * Vecd(0.0, 1.0) +
+                        (SGDifferenceDJdr() * SGDifferenceW(r) * Vecd(0.0, 1.0) +
                          Jij * RhoKernelDW(r) * e);
             }
         }
@@ -3377,6 +3463,54 @@ static int RunCgCase(int ac, char *av[])
     report(0.0, dt, 0, true);
 
     //-------------------------------------------------------------------------
+    //  M1.4 §21: residual-force / error-budget time series.
+    //  Written every --sg-budget-every steps.  B_r = |<Fr_measure>| / RMS(F_int)
+    //  is the fixed budget metric used to decide whether an observed axial
+    //  growth could be a side effect of the radial measure residual.
+    //-------------------------------------------------------------------------
+    std::ofstream budget_csv;
+    const Vecd *budget_sgf = nullptr;
+    if (run_options.sg_budget_every > 0)
+    {
+        budget_sgf = particles_body.getBaseParticles()
+                         .getVariableDataByName<Vecd>("CG_SGForce");
+        budget_csv.open("sg_budget.csv");
+        budget_csv << std::setprecision(10);
+        budget_csv << "time,steps,N,mean_Fr,rms_Fr,rms_F,rms_Fz,mean_Fz,B_r,"
+                      "mean_r,mean_h\n";
+    }
+    auto write_budget = [&](Real t, size_t st) {
+        if (run_options.sg_budget_every <= 0 || !budget_csv.is_open())
+            return;
+        const Vecd *pos = particles_body.getBaseParticles()
+                              .getVariableDataByName<Vecd>("Position");
+        const size_t n = particles_body.getBaseParticles().TotalRealParticles();
+        Real s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0, s5 = 0.0, sr = 0.0, sh = 0.0;
+        for (size_t i = 0; i != n; ++i)
+        {
+            const Real fr = budget_sgf[i][1];
+            const Real fz = budget_sgf[i][0];
+            const Real fn = budget_sgf[i].norm();
+            s1 += fr;
+            s2 += fr * fr;
+            s3 += fn * fn;
+            s4 += fz * fz;
+            s5 += fz;
+            sr += pos[i][1];
+            sh += pos[i][1] - AxisRadius();
+        }
+        const Real nn = static_cast<Real>(n);
+        const Real mean_fr = s1 / nn;
+        const Real rms_f = std::sqrt(s3 / nn);
+        budget_csv << t << "," << st << "," << n << "," << mean_fr << ","
+                   << std::sqrt(s2 / nn) << "," << rms_f << ","
+                   << std::sqrt(s4 / nn) << "," << (s5 / nn) << ","
+                   << (rms_f > 0.0 ? std::abs(mean_fr) / rms_f : 0.0) << ","
+                   << (sr / nn) << "," << (sh / nn) << "\n";
+    };
+    write_budget(0.0, 0);
+
+    //-------------------------------------------------------------------------
     //  BAOAB main loop
     //-------------------------------------------------------------------------
     Real physical_time = 0.0;
@@ -3428,6 +3562,11 @@ static int RunCgCase(int ac, char *av[])
         {
             ++frame;
             report(physical_time, dt_now, steps, true);
+        }
+        else if (run_options.sg_budget_every > 0 &&
+                 steps % static_cast<size_t>(run_options.sg_budget_every) == 0)
+        {
+            write_budget(physical_time, steps);
         }
     }
 
