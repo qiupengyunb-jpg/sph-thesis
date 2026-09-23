@@ -146,6 +146,14 @@ struct RunOptions
     Real film_perturb_amp = 0.0;      /**< A / sigma, 0 = no axial modulation */
     int film_perturb_mode = 1;        /**< n in A sin(2 pi n z / Lz) */
     bool film_broadband = false;      /**< Stage 1: broadband axial seed */
+    // ---- Stage 9: equilibrate-then-perturb workflow (EXPERIMENTAL, default off)
+    //  When --perturb-after-equilibration=1 the M1.4 single-mode mapping is NOT
+    //  applied at t=0; instead the film is equilibrated unperturbed until
+    //  --equilibrate-until and the same mapping is then applied once to the
+    //  CURRENT particle positions.  With the switch off (default) every
+    //  existing path is bit-identical.
+    bool perturb_after_equilibration = false;
+    Real equilibrate_until = 0.0;     /**< t_eq in time units; 0 = no hook */
     bool axisym_jacobian = false;     /**< explicit -kBT ln(2 pi r) measure */
     int sg_fd_check = 0; /**< M1.3/N1: run the energy-force FD check and exit */
     // ---- N3 diagnostic-only switches (all default OFF; none changes the
@@ -669,6 +677,11 @@ void ParseCommandLine(int argc, char *argv[])
             run_options.film_perturb_mode = ToInt(a, "--film-perturb-mode=");
         else if (StartsWith(a, "--film-broadband="))
             run_options.film_broadband = ToInt(a, "--film-broadband=") != 0;
+        else if (StartsWith(a, "--perturb-after-equilibration="))
+            run_options.perturb_after_equilibration =
+                ToInt(a, "--perturb-after-equilibration=") != 0;
+        else if (StartsWith(a, "--equilibrate-until="))
+            run_options.equilibrate_until = ToReal(a, "--equilibrate-until=");
         else if (StartsWith(a, "--axisym-jacobian="))
             run_options.axisym_jacobian = ToInt(a, "--axisym-jacobian=") != 0;
         else if (StartsWith(a, "--sg-fd-check="))
@@ -777,6 +790,16 @@ void ParseCommandLine(int argc, char *argv[])
         throw std::runtime_error(
             "--axisym-interface-scheme=difference_energy requires --axisymmetric="
             "filmonly; the legacy 2D path keeps the frozen A-1 moving-J energy.");
+    if (run_options.perturb_after_equilibration)
+    {
+        if (!Axisymmetric() || run_options.init_mode != "film")
+            throw std::runtime_error(
+                "--perturb-after-equilibration requires --axisymmetric=filmonly "
+                "--init=film.");
+        if (run_options.equilibrate_until <= 0.0)
+            throw std::runtime_error(
+                "--perturb-after-equilibration requires --equilibrate-until > 0.");
+    }
     if (run_options.axis_radius <= 0.0)
         throw std::runtime_error("--fibre-radius-const must be positive.");
     if (run_options.film_thickness <= 0.0)
@@ -1306,7 +1329,11 @@ class ParticleGenerator<BaseParticles, CGRandomScatter>
         }
         const Real h_out_layer =
             h_in + static_cast<Real>(std::max(rows_planned - 1, 0)) * dr;
-        const Real pert_amp = run_options.film_perturb_amp;
+        // Stage 9: with the equilibrate-then-perturb workflow the mapping is
+        // not applied to the lattice at all; it is applied once after Phase E.
+        const Real pert_amp = run_options.perturb_after_equilibration
+                                  ? 0.0
+                                  : run_options.film_perturb_amp;
         const Real pert_kz = (pert_amp != 0.0)
                                  ? 2.0 * Pi *
                                        static_cast<Real>(run_options.film_perturb_mode) / lz
@@ -3497,6 +3524,54 @@ static int RunCgCase(int ac, char *av[])
     //-------------------------------------------------------------------------
     std::ofstream budget_csv;
     const Vecd *budget_sgf = nullptr;
+
+    //-------------------------------------------------------------------------
+    //  Stage 9: one-shot post-equilibration single-mode perturbation.
+    //  Same radial mapping as M1.4:
+    //      h = r - R0,  f = 1 + A sin(2 pi m z / Lz),  r <- r + (h - h_in)(f - 1)
+    //  applied to the CURRENT positions once, at the first step whose physical
+    //  time reaches --equilibrate-until.  z is untouched and no random
+    //  component is added.  Inactive (and bit-identical to the old path) unless
+    //  --perturb-after-equilibration=1.
+    //-------------------------------------------------------------------------
+    bool eq_perturb_done = false;
+    auto apply_post_eq_perturbation = [&](Real t_now) {
+        if (eq_perturb_done || !run_options.perturb_after_equilibration ||
+            run_options.film_perturb_amp == 0.0)
+            return;
+        const Real amp = run_options.film_perturb_amp;
+        const Real mode_m = static_cast<Real>(run_options.film_perturb_mode);
+        const Real h_in = FilmInnerOffset();
+        const Real r0 = AxisRadius();
+        const Real lz = DomainLength();
+        const Real kz = 2.0 * Pi * mode_m / lz;
+        Vecd *pos = particles_body.getBaseParticles()
+                        .getVariableDataByName<Vecd>("Position");
+        const size_t n = particles_body.getBaseParticles().TotalRealParticles();
+        Real vol_before = 0.0, vol_after = 0.0;
+        for (size_t i = 0; i != n; ++i)
+        {
+            const Real r = pos[i][1];
+            const Real h = r - r0;
+            const Real f = 1.0 + amp * std::sin(kz * pos[i][0]);
+            vol_before += (2.0 * r * h - h * h);
+            const Real r_new = r + (h - h_in) * (f - 1.0);
+            const Real h_new = r_new - r0;
+            vol_after += (2.0 * r_new * h_new - h_new * h_new);
+            pos[i][1] = r_new;
+        }
+        std::cout << "  [Stage9] post-equilibration perturbation applied at t=" << t_now
+                  << "  A=" << amp << " m=" << run_options.film_perturb_mode
+                  << "  vol_ratio=" << (vol_before > 0.0 ? vol_after / vol_before : 0.0)
+                  << "\n";
+        std::ofstream fh("eq_perturb_applied.txt");
+        fh << std::setprecision(17) << "t_eq=" << t_now << "\nA=" << amp
+           << "\nm=" << run_options.film_perturb_mode
+           << "\nvol_ratio=" << (vol_before > 0.0 ? vol_after / vol_before : 0.0)
+           << "\nvol_metric=sum(2 r h - h^2)\n";
+        fh.close();
+        eq_perturb_done = true;
+    };
     if (run_options.sg_budget_every > 0)
     {
         budget_sgf = particles_body.getBaseParticles()
@@ -3571,6 +3646,11 @@ static int RunCgCase(int ac, char *av[])
 
         physical_time += dt_now;
         ++steps;
+
+        // Stage 9 hook: fire once, as soon as Phase E has reached t_eq.
+        if (run_options.equilibrate_until > 0.0 &&
+            physical_time >= run_options.equilibrate_until)
+            apply_post_eq_perturbation(physical_time);
 
         const FrameDiagnostics now = CollectDiagnostics(particles_body);
         if (!std::isfinite(now.max_speed) || now.max_speed > 1.0e3)
