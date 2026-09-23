@@ -1,0 +1,2 @@
+t_start,t_end,T,n_frames,n_flicker,stable_beads,birth_count,R_birth,true_merge,unresolved_events,true_death,R_merge,detection_gap,gap_frames_total,median_bead_lifetime,mean_migration_speed,median_migration_speed,max_bead_count,parameter
+40.005,1000.0,959.995,961,26,57,57,0.05937530924640232,6,26,20,0.006250032552252876,100,210,18.0,0.7906961108181971,0.7382794239726033,7,S1_F2

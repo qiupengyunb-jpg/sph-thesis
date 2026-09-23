@@ -37,10 +37,12 @@ LARGEST_FRAC_MAX = 0.45     # no single bead has swallowed the film
 MODULATION_MIN = 0.15       # peak-to-mean modulation A_dom / <h>
 HOLD_TIME_MIN = 20.0        # sustained for at least this many time units
 DOM_LAMBDA_DRIFT_MAX = 0.25  # dominant wavelength drift over the window
+PROM_ABS_SIGMA = 0.30        # absolute prominence floor = measured noise floor
+                             # (PC2 S3_F1 near-continuous film shows ~0.3 sigma)
 # F2 = multi-bead but not (yet) satisfying the F3 regularity/persistence part.
 
 
-def find_peaks_periodic(h, min_dist_bins, prominence):
+def find_peaks_periodic(h, min_dist_bins, prominence, legacy=False):
     """Topographic peaks with prominence, periodic in the array.
 
     Uses scipy.signal.find_peaks(mode="wrap") so that "prominence" means the
@@ -50,6 +52,18 @@ def find_peaks_periodic(h, min_dist_bins, prominence):
     detected single-bin spikes, which is exactly the flicker source found in
     the Stage-2 pre-check.
     """
+    if legacy:
+        # the pre-Stage-2 rule: immediate-neighbour difference used as if it
+        # were a prominence.  Kept ONLY for the old-vs-new detector comparison.
+        n = len(h)
+        idx = [i for i in range(n)
+               if h[i] > h[(i - 1) % n] and h[i] >= h[(i + 1) % n] and h[i] > 0]
+        kept = []
+        for i in sorted(idx, key=lambda k: -h[k]):
+            if all(min(abs(i - j), n - abs(i - j)) >= min_dist_bins for j in kept):
+                kept.append(i)
+        return [i for i in sorted(kept)
+                if h[i] - min(h[(i - 1) % n], h[(i + 1) % n]) >= prominence]
     from scipy.signal import find_peaks
     h = np.asarray(h, float)
     n = h.size
@@ -62,6 +76,11 @@ def find_peaks_periodic(h, min_dist_bins, prominence):
 
 
 def frame_metrics(h, z_grid, R0, Lz, mmax=12, min_dist_sigma=2.0):
+    return frame_metrics_ex(h, z_grid, R0, Lz, mmax, min_dist_sigma)
+
+
+def frame_metrics_ex(h, z_grid, R0, Lz, mmax=12, min_dist_sigma=2.0,
+                     legacy=False, prom_frac=0.12):
     rec = {}
     n = h.size
     dz = Lz / n
@@ -76,8 +95,11 @@ def frame_metrics(h, z_grid, R0, Lz, mmax=12, min_dist_sigma=2.0):
     rec["spectrum"] = ";".join("%d:%.4f" % (m, A[m]) for m in sorted(A))
 
     amp = float(np.max(h) - np.min(h))
-    prom = max(0.02, 0.12 * amp)
-    peaks = find_peaks_periodic(h, max(1, int(min_dist_sigma / dz)), prom)
+    # Absolute floor matters: on a near-continuous film the relative term
+    # collapses and a purely relative threshold would report the reconstruction
+    # noise as beads (measured on PC2's S3_F1, see Stage-2 reanalysis report).
+    prom = max(PROM_ABS_SIGMA, prom_frac * amp)
+    peaks = find_peaks_periodic(h, max(1, int(min_dist_sigma / dz)), prom, legacy)
     rec["bead_count"] = len(peaks)
     if len(peaks) >= 1:
         rec["bead_z"] = ";".join("%.3f" % (zi * dz) for zi in peaks)
@@ -130,6 +152,10 @@ def main():
     ap.add_argument("--t-lo", type=float, default=0.0)
     ap.add_argument("--t-hi", type=float, default=1e9)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--legacy", action="store_true",
+                    help="use the pre-Stage-2 immediate-neighbour prominence rule")
+    ap.add_argument("--prom-frac", type=float, default=0.12)
+    ap.add_argument("--smooth", type=float, default=0.0)
     a = ap.parse_args()
     nbins = a.nbins or max(48, int(round(a.Lz * 2.0)))
     files = M.frame_list(a.run_dir)
@@ -143,7 +169,10 @@ def main():
             h = hfun(z, r, a.R0, a.Lz, nbins)
             if np.all(np.isnan(h)):
                 continue
-            rec = frame_metrics(h, None, a.R0, a.Lz, a.mmax)
+            if a.smooth:
+                h = M._fill_and_smooth(h, nbins, a.smooth)
+            rec = frame_metrics_ex(h, None, a.R0, a.Lz, a.mmax, 2.0,
+                                   a.legacy, a.prom_frac)
             rec.update(time=float(tf), method=tag, n=int(z.size),
                        file=os.path.basename(f))
             rows.append(rec)

@@ -1,0 +1,227 @@
+time,kind,bead,partner,z,d_pair,note
+40.005,birth,0,-1,17.5,nan,registered after 2 frames
+40.005,birth,1,-1,29.5,nan,registered after 2 frames
+40.005,birth,2,-1,38.5,nan,registered after 2 frames
+41.0025,birth,3,-1,49.0,nan,registered after 2 frames
+44.0025,detection_gap,2,-1,32.0,nan,reacquired after 2 missed frames
+45.0,detection_gap,1,-1,33.0,nan,reacquired after 1 missed frames
+46.005,detection_gap,1,-1,33.5,nan,reacquired after 1 missed frames
+47.0025,detection_gap,1,-1,34.5,nan,reacquired after 1 missed frames
+57.0,birth,4,-1,64.0,nan,registered after 2 frames
+62.0025,birth,5,-1,16.5,nan,registered after 2 frames
+75.0,birth,6,-1,66.0,nan,registered after 2 frames
+78.0,detection_gap,6,-1,66.0,nan,reacquired after 1 missed frames
+79.005,detection_gap,6,-1,66.0,nan,reacquired after 1 missed frames
+80.0025,detection_gap,6,-1,66.0,nan,reacquired after 1 missed frames
+85.005,detection_gap,6,-1,66.0,nan,reacquired after 1 missed frames
+86.0025,detection_gap,6,-1,66.0,nan,reacquired after 1 missed frames
+87.0,detection_gap,6,-1,66.5,nan,reacquired after 1 missed frames
+90.0,birth,7,-1,51.0,nan,registered after 2 frames
+111.0,birth,8,-1,74.5,nan,registered after 2 frames
+114.0,detection_gap,8,-1,74.0,nan,reacquired after 1 missed frames
+115.005,detection_gap,8,-1,73.5,nan,reacquired after 1 missed frames
+130.005,birth,9,-1,77.0,nan,registered after 2 frames
+142.005,birth,10,-1,16.5,nan,registered after 2 frames
+148.005,birth,11,-1,63.5,nan,registered after 2 frames
+161.0025,birth,12,-1,15.0,nan,registered after 2 frames
+173.0025,detection_gap,12,-1,16.5,nan,reacquired after 1 missed frames
+174.0,detection_gap,12,-1,17.0,nan,reacquired after 1 missed frames
+175.005,detection_gap,12,-1,18.5,nan,reacquired after 1 missed frames
+237.0,birth,13,-1,29.0,nan,registered after 2 frames
+240.0,detection_gap,13,-1,33.0,nan,reacquired after 1 missed frames
+241.005,detection_gap,13,-1,33.0,nan,reacquired after 1 missed frames
+242.0025,birth,14,-1,23.5,nan,registered after 2 frames
+246.0,detection_gap,14,-1,31.0,nan,reacquired after 2 missed frames
+247.005,detection_gap,13,-1,30.5,nan,reacquired after 2 missed frames
+248.0025,detection_gap,13,-1,29.5,nan,reacquired after 2 missed frames
+249.0,detection_gap,13,-1,30.0,nan,reacquired after 1 missed frames
+248.0025,birth,15,-1,23.0,nan,registered after 2 frames
+262.005,birth,16,-1,27.0,nan,registered after 2 frames
+266.0025,detection_gap,16,-1,22.0,nan,reacquired after 1 missed frames
+267.0,detection_gap,16,-1,24.0,nan,reacquired after 1 missed frames
+268.005,detection_gap,16,-1,24.0,nan,reacquired after 1 missed frames
+270.0,birth,17,-1,57.5,nan,registered after 2 frames
+275.0025,detection_gap,17,-1,64.5,nan,reacquired after 1 missed frames
+276.0,detection_gap,11,-1,65.5,nan,reacquired after 1 missed frames
+277.005,detection_gap,11,-1,66.5,nan,reacquired after 1 missed frames
+278.0025,detection_gap,11,-1,65.5,nan,reacquired after 1 missed frames
+282.0,birth,18,-1,58.0,nan,registered after 2 frames
+288.0,birth,19,-1,28.0,nan,registered after 2 frames
+295.005,birth,20,-1,38.0,nan,registered after 2 frames
+301.005,detection_gap,18,-1,56.0,nan,reacquired after 2 missed frames
+302.0025,detection_gap,18,-1,56.5,nan,reacquired after 2 missed frames
+303.0,detection_gap,18,-1,58.0,nan,reacquired after 1 missed frames
+308.0025,birth,22,-1,24.0,nan,registered after 2 frames
+312.0,birth,23,-1,59.0,nan,registered after 2 frames
+316.005,detection_gap,23,-1,59.0,nan,reacquired after 2 missed frames
+317.0025,birth,24,-1,29.0,nan,registered after 2 frames
+321.0,detection_gap,24,-1,30.0,nan,reacquired after 1 missed frames
+320.0025,birth,25,-1,57.0,nan,registered after 2 frames
+322.005,detection_gap,24,-1,31.5,nan,reacquired after 1 missed frames
+323.0025,detection_gap,24,-1,31.0,nan,reacquired after 1 missed frames
+327.0,birth,26,-1,60.0,nan,registered after 2 frames
+339.0,birth,28,-1,68.0,nan,registered after 2 frames
+354.0,birth,29,-1,72.0,nan,registered after 2 frames
+358.005,detection_gap,29,-1,73.0,nan,reacquired after 2 missed frames
+367.005,detection_gap,26,-1,63.5,nan,reacquired after 1 missed frames
+368.0025,detection_gap,26,-1,64.5,nan,reacquired after 1 missed frames
+369.0,detection_gap,26,-1,64.5,nan,reacquired after 1 missed frames
+375.0,birth,31,-1,51.5,nan,registered after 2 frames
+381.0,detection_gap,31,-1,62.5,nan,reacquired after 2 missed frames
+382.005,detection_gap,31,-1,63.5,nan,reacquired after 2 missed frames
+383.0025,detection_gap,31,-1,63.5,nan,reacquired after 1 missed frames
+382.005,birth,32,-1,51.5,nan,registered after 2 frames
+395.0025,birth,33,-1,53.0,nan,registered after 2 frames
+421.005,birth,35,-1,37.5,nan,registered after 2 frames
+422.0025,birth,36,-1,68.0,nan,registered after 2 frames
+462.0,birth,37,-1,72.0,nan,registered after 2 frames
+478.005,birth,38,-1,61.0,nan,registered after 2 frames
+484.005,birth,39,-1,49.5,nan,registered after 2 frames
+492.0,detection_gap,39,-1,60.0,nan,reacquired after 1 missed frames
+493.005,detection_gap,38,-1,58.0,nan,reacquired after 1 missed frames
+494.0025,detection_gap,38,-1,57.0,nan,reacquired after 1 missed frames
+495.0,detection_gap,38,-1,56.5,nan,reacquired after 1 missed frames
+496.005,birth,40,-1,65.5,nan,registered after 2 frames
+508.005,birth,42,-1,30.5,nan,registered after 2 frames
+522.0,birth,44,-1,58.5,nan,registered after 2 frames
+527.0025,detection_gap,44,-1,64.5,nan,reacquired after 1 missed frames
+528.0,detection_gap,44,-1,63.0,nan,reacquired after 1 missed frames
+529.005,detection_gap,44,-1,62.0,nan,reacquired after 1 missed frames
+536.0025,birth,45,-1,70.0,nan,registered after 2 frames
+539.0025,birth,46,-1,65.5,nan,registered after 2 frames
+541.005,detection_gap,45,-1,68.5,nan,reacquired after 1 missed frames
+542.0025,detection_gap,46,-1,68.5,nan,reacquired after 1 missed frames
+543.0,detection_gap,45,-1,67.0,nan,reacquired after 2 missed frames
+544.005,detection_gap,45,-1,68.0,nan,reacquired after 1 missed frames
+545.0025,detection_gap,45,-1,68.5,nan,reacquired after 1 missed frames
+559.005,birth,47,-1,66.0,nan,registered after 2 frames
+563.0025,detection_gap,47,-1,64.5,nan,reacquired after 2 missed frames
+564.0,detection_gap,47,-1,63.0,nan,reacquired after 1 missed frames
+599.0025,detection_gap,38,-1,47.0,nan,reacquired after 1 missed frames
+600.0,detection_gap,38,-1,47.0,nan,reacquired after 1 missed frames
+601.005,detection_gap,38,-1,47.5,nan,reacquired after 1 missed frames
+620.0025,birth,48,-1,21.0,nan,registered after 2 frames
+630.0,detection_gap,38,-1,62.0,nan,reacquired after 2 missed frames
+631.005,detection_gap,38,-1,61.5,nan,reacquired after 2 missed frames
+632.0025,detection_gap,38,-1,62.0,nan,reacquired after 1 missed frames
+649.005,birth,49,-1,12.0,nan,registered after 2 frames
+658.005,detection_gap,42,-1,57.0,nan,reacquired after 1 missed frames
+659.0025,detection_gap,42,-1,57.0,nan,reacquired after 1 missed frames
+660.0,detection_gap,42,-1,56.0,nan,reacquired after 1 missed frames
+659.0025,birth,50,-1,76.5,nan,registered after 2 frames
+663.0,detection_gap,38,-1,67.0,nan,reacquired after 2 missed frames
+664.005,detection_gap,38,-1,67.0,nan,reacquired after 2 missed frames
+665.0025,detection_gap,38,-1,66.5,nan,reacquired after 1 missed frames
+668.0025,detection_gap,50,-1,1.0,nan,reacquired after 1 missed frames
+670.005,detection_gap,50,-1,4.0,nan,reacquired after 2 missed frames
+671.0025,detection_gap,50,-1,4.5,nan,reacquired after 1 missed frames
+672.0,detection_gap,50,-1,4.5,nan,reacquired after 1 missed frames
+676.005,birth,52,-1,44.5,nan,registered after 2 frames
+682.005,birth,53,-1,10.0,nan,registered after 2 frames
+686.0025,birth,54,-1,74.5,nan,registered after 2 frames
+702.0,birth,58,-1,75.5,nan,registered after 2 frames
+704.0025,birth,59,-1,19.5,nan,registered after 2 frames
+726.0,birth,60,-1,16.5,nan,registered after 2 frames
+731.0025,detection_gap,60,-1,18.5,nan,reacquired after 1 missed frames
+732.0,detection_gap,60,-1,18.0,nan,reacquired after 1 missed frames
+733.005,detection_gap,60,-1,19.0,nan,reacquired after 1 missed frames
+743.0025,birth,61,-1,22.5,nan,registered after 2 frames
+745.005,detection_gap,60,-1,29.5,nan,reacquired after 1 missed frames
+751.005,birth,62,-1,14.0,nan,registered after 2 frames
+791.0025,birth,64,-1,39.0,nan,registered after 2 frames
+793.005,birth,66,-1,10.0,nan,registered after 2 frames
+794.0025,birth,67,-1,23.0,nan,registered after 2 frames
+798.0,detection_gap,64,-1,39.0,nan,reacquired after 1 missed frames
+798.0,detection_gap,66,-1,9.0,nan,reacquired after 1 missed frames
+799.005,detection_gap,64,-1,38.5,nan,reacquired after 1 missed frames
+799.005,birth,68,-1,72.5,nan,registered after 2 frames
+803.0025,birth,69,-1,59.0,nan,registered after 2 frames
+806.0025,detection_gap,68,-1,70.5,nan,reacquired after 2 missed frames
+807.0,detection_gap,68,-1,71.0,nan,reacquired after 2 missed frames
+808.005,detection_gap,68,-1,70.0,nan,reacquired after 1 missed frames
+815.0025,detection_gap,68,-1,66.0,nan,reacquired after 2 missed frames
+816.0,detection_gap,68,-1,67.5,nan,reacquired after 2 missed frames
+819.0,detection_gap,68,-1,72.0,nan,reacquired after 2 missed frames
+879.0,birth,72,-1,53.0,nan,registered after 2 frames
+883.005,detection_gap,72,-1,55.0,nan,reacquired after 1 missed frames
+884.0025,detection_gap,72,-1,54.5,nan,reacquired after 1 missed frames
+911.0025,birth,73,-1,43.5,nan,registered after 2 frames
+916.005,birth,74,-1,29.0,nan,registered after 2 frames
+925.005,birth,76,-1,51.5,nan,registered after 2 frames
+924.0,birth,75,-1,19.0,nan,registered after 2 frames
+928.005,detection_gap,75,-1,13.0,nan,reacquired after 2 missed frames
+929.0025,detection_gap,75,-1,10.0,nan,reacquired after 1 missed frames
+930.0,detection_gap,74,-1,35.0,nan,reacquired after 2 missed frames
+931.005,detection_gap,38,-1,35.0,nan,reacquired after 1 missed frames
+932.0025,detection_gap,38,-1,35.0,nan,reacquired after 1 missed frames
+933.0,detection_gap,38,-1,35.5,nan,reacquired after 1 missed frames
+933.0,detection_gap,75,-1,1.0,nan,reacquired after 2 missed frames
+934.005,detection_gap,75,-1,0.0,nan,reacquired after 2 missed frames
+935.0025,detection_gap,75,-1,0.0,nan,reacquired after 1 missed frames
+938.0025,birth,77,-1,7.5,nan,registered after 2 frames
+941.0025,birth,78,-1,31.5,nan,registered after 2 frames
+947.0025,detection_gap,78,-1,34.5,nan,reacquired after 1 missed frames
+948.0,detection_gap,78,-1,33.0,nan,reacquired after 1 missed frames
+949.005,detection_gap,78,-1,30.5,nan,reacquired after 1 missed frames
+951.0,birth,79,-1,37.0,nan,registered after 2 frames
+977.0025,birth,80,-1,11.5,nan,registered after 2 frames
+981.0,birth,81,-1,27.0,nan,registered after 2 frames
+986.0025,birth,82,-1,33.5,nan,registered after 2 frames
+995.0025,detection_gap,38,-1,61.5,nan,reacquired after 2 missed frames
+996.0,detection_gap,38,-1,63.0,nan,reacquired after 2 missed frames
+996.0,detection_gap,69,-1,58.0,nan,reacquired after 1 missed frames
+997.005,detection_gap,38,-1,65.0,nan,reacquired after 1 missed frames
+997.005,detection_gap,69,-1,57.5,nan,reacquired after 1 missed frames
+998.0025,detection_gap,69,-1,57.5,nan,reacquired after 1 missed frames
+57.0,true_death,0,1,16.0,23.0,no survivor within 6.0 sigma
+151.005,unresolved,1,11,53.0,0.5,near survivor but shrinking=False size_compatible=False
+62.0025,true_death,4,1,61.5,22.0,no survivor within 6.0 sigma
+66.0,true_death,5,1,7.5,33.0,no survivor within 6.0 sigma
+115.005,unresolved,6,8,67.5,4.5,near survivor but shrinking=True size_compatible=False
+932.0025,unresolved,8,75,1.5,0.5,near survivor but shrinking=True size_compatible=False
+136.005,unresolved,9,8,75.5,4.5,near survivor but shrinking=True size_compatible=False
+157.005,true_death,10,8,14.5,21.0,no survivor within 6.0 sigma
+300.0,unresolved,11,18,58.5,2.5,near survivor but shrinking=True size_compatible=False
+233.0025,true_death,12,8,27.5,13.0,no survivor within 6.0 sigma
+257.0025,true_death,13,8,24.5,7.5,no survivor within 6.0 sigma
+273.0,unresolved,16,8,24.5,4.5,near survivor but shrinking=True size_compatible=False
+275.0025,unresolved,17,11,64.5,1.0,near survivor but shrinking=True size_compatible=False
+468.0,unresolved,18,37,62.0,2.5,near survivor but shrinking=True size_compatible=False
+311.0025,unresolved,22,8,29.0,6.0,near survivor but shrinking=False size_compatible=False
+469.005,unresolved,24,37,70.5,5.5,near survivor but shrinking=False size_compatible=False
+375.0,unresolved,26,18,63.5,3.5,near survivor but shrinking=True size_compatible=False
+342.0,true_death,28,26,71.5,10.0,no survivor within 6.0 sigma
+388.005,unresolved,31,18,61.0,5.0,near survivor but shrinking=True size_compatible=False
+386.0025,unresolved,32,18,51.5,5.5,near survivor but shrinking=False size_compatible=False
+403.005,unresolved,33,8,45.0,5.5,near survivor but shrinking=True size_compatible=False
+485.0025,unresolved,35,8,38.5,6.0,near survivor but shrinking=False size_compatible=False
+449.0025,unresolved,36,24,75.0,3.0,near survivor but shrinking=True size_compatible=False
+549.0,unresolved,37,45,63.5,4.0,near survivor but shrinking=True size_compatible=False
+492.0,true_merge,39,38,60.0,2.0,shrinking pair + compatible size
+525.0,unresolved,40,37,66.5,3.0,near survivor but shrinking=True size_compatible=False
+692.0025,true_death,42,38,57.0,12.0,no survivor within 6.0 sigma
+532.005,unresolved,44,37,59.5,3.5,near survivor but shrinking=False size_compatible=False
+680.0025,unresolved,45,38,77.5,3.5,near survivor but shrinking=False size_compatible=True
+614.0025,true_death,47,38,59.5,6.5,no survivor within 6.0 sigma
+623.0025,true_death,48,8,24.0,11.5,no survivor within 6.0 sigma
+654.0,true_death,49,8,12.5,11.0,no survivor within 6.0 sigma
+696.0,true_death,50,8,9.5,8.0,no survivor within 6.0 sigma
+716.0025,true_death,52,38,43.5,16.5,no survivor within 6.0 sigma
+686.0025,unresolved,53,50,12.0,5.5,near survivor but shrinking=False size_compatible=False
+695.0025,true_merge,54,38,73.5,2.5,shrinking pair + compatible size
+796.005,true_death,58,8,69.5,10.5,no survivor within 6.0 sigma
+733.005,unresolved,59,60,25.0,2.0,near survivor but shrinking=True size_compatible=False
+745.005,true_death,60,61,29.5,12.0,no survivor within 6.0 sigma
+747.0,true_death,61,8,17.5,10.0,no survivor within 6.0 sigma
+756.0,true_death,62,8,15.5,10.0,no survivor within 6.0 sigma
+799.005,true_death,64,67,38.5,14.5,no survivor within 6.0 sigma
+798.0,true_death,66,8,9.0,7.5,no survivor within 6.0 sigma
+859.005,unresolved,67,38,41.0,6.0,near survivor but shrinking=False size_compatible=True
+819.0,true_death,68,69,72.0,6.5,no survivor within 6.0 sigma
+884.0025,true_merge,72,69,54.5,5.0,shrinking pair + compatible size
+916.005,unresolved,73,38,42.0,5.0,near survivor but shrinking=False size_compatible=True
+930.0,true_merge,74,38,35.0,0.0,shrinking pair + compatible size
+943.005,true_merge,76,38,42.5,3.5,shrinking pair + compatible size
+950.0025,unresolved,77,75,8.0,5.5,near survivor but shrinking=False size_compatible=True
+967.005,true_merge,78,79,23.5,2.0,shrinking pair + compatible size
+987.0,unresolved,81,82,27.5,3.5,near survivor but shrinking=False size_compatible=True
