@@ -154,6 +154,15 @@ struct RunOptions
     //  existing path is bit-identical.
     bool perturb_after_equilibration = false;
     Real equilibrate_until = 0.0;     /**< t_eq in time units; 0 = no hook */
+    // ---- Stage 21: opt-in two-scale Scheme E kernel (EXPERIMENTAL, default off)
+    //  --interface-kernel=legacy (default) keeps the historical single-scale
+    //  Wendland kernel bit-for-bit; two_scale uses
+    //      K_new = [ c_h W_h - beta c_xi W_xi ] / (1 - beta)
+    //  with c_h = 144/(5h^2), c_xi = 144/(5 xi^2) so that both terms and the
+    //  combination satisfy Int|u|^2 K = 4 (lambda keeps its meaning).
+    std::string interface_kernel = "legacy";
+    Real interface_xi = 4.0;          /**< xi / sigma (long-range lobe support) */
+    Real interface_beta = 0.3;        /**< mixing weight, 0 < beta < 1 */
     bool axisym_jacobian = false;     /**< explicit -kBT ln(2 pi r) measure */
     int sg_fd_check = 0; /**< M1.3/N1: run the energy-force FD check and exit */
     // ---- N3 diagnostic-only switches (all default OFF; none changes the
@@ -682,6 +691,12 @@ void ParseCommandLine(int argc, char *argv[])
                 ToInt(a, "--perturb-after-equilibration=") != 0;
         else if (StartsWith(a, "--equilibrate-until="))
             run_options.equilibrate_until = ToReal(a, "--equilibrate-until=");
+        else if (StartsWith(a, "--interface-kernel="))
+            run_options.interface_kernel = ToString(a, "--interface-kernel=");
+        else if (StartsWith(a, "--interface-xi="))
+            run_options.interface_xi = ToReal(a, "--interface-xi=");
+        else if (StartsWith(a, "--interface-beta="))
+            run_options.interface_beta = ToReal(a, "--interface-beta=");
         else if (StartsWith(a, "--axisym-jacobian="))
             run_options.axisym_jacobian = ToInt(a, "--axisym-jacobian=") != 0;
         else if (StartsWith(a, "--sg-fd-check="))
@@ -799,6 +814,28 @@ void ParseCommandLine(int argc, char *argv[])
         if (run_options.equilibrate_until <= 0.0)
             throw std::runtime_error(
                 "--perturb-after-equilibration requires --equilibrate-until > 0.");
+    }
+    if (run_options.interface_kernel != "legacy" &&
+        run_options.interface_kernel != "two_scale")
+        throw std::runtime_error("--interface-kernel must be legacy or two_scale.");
+    if (run_options.interface_kernel == "two_scale")
+    {
+        if (!Axisymmetric())
+            throw std::runtime_error(
+                "--interface-kernel=two_scale requires --axisymmetric=filmonly.");
+        if (run_options.axisym_interface_scheme != "difference_energy")
+            throw std::runtime_error(
+                "--interface-kernel=two_scale requires "
+                "--axisym-interface-scheme=difference_energy.");
+        if (!(run_options.interface_beta > 0.0 && run_options.interface_beta < 1.0))
+            throw std::runtime_error("--interface-beta must satisfy 0 < beta < 1.");
+        if (run_options.interface_xi <= run_options.interface_h)
+            throw std::runtime_error("--interface-xi must exceed --interface-gradient-h.");
+        if (run_options.interface_xi > 0.99 * 2.6 * ParticleSpacing())
+            throw std::runtime_error(
+                "--interface-xi exceeds the neighbour cut-off (2h = 2.6 dx); the "
+                "long-range lobe of the two-scale kernel would be truncated "
+                "silently.  Coarsen the lattice or enlarge the cut-off instead.");
     }
     if (run_options.axis_radius <= 0.0)
         throw std::runtime_error("--fibre-radius-const must be positive.");
@@ -1622,6 +1659,79 @@ inline Real RhoKernelDDW(Real r)
     return -(140.0 / (Pi * h * h * h * h)) * t * t * (1.0 - 4.0 * q);
 }
 
+//=============================================================================
+//  Stage 21: opt-in two-scale Scheme E kernel factory
+//
+//      K_new(r) = [ c_h W_h(r) - beta c_xi W_xi(r) ] / (1 - beta)
+//      c_h = 144/(5 h^2),  c_xi = 144/(5 xi^2)
+//
+//  Both terms individually satisfy Int|u|^2 (c W) dA = 4, so the combination
+//  does as well; the continuum limit of the pair-difference energy (and hence
+//  the meaning of lambda) is therefore unchanged and lambda needs no
+//  recalibration.  With --interface-kernel=legacy (default) every call falls
+//  through to the original single-scale functions, so the historical
+//  trajectories stay bit-identical.
+//=============================================================================
+inline Real TwoScaleKernelWRaw(Real r, Real hw)
+{
+    const Real q = r / hw;
+    if (q >= 1.0)
+        return 0.0;
+    const Real t = 1.0 - q;
+    return (7.0 / (Pi * hw * hw)) * t * t * t * t * (4.0 * q + 1.0);
+}
+
+inline Real TwoScaleKernelDWRaw(Real r, Real hw)
+{
+    const Real q = r / hw;
+    if (q >= 1.0)
+        return 0.0;
+    const Real t = 1.0 - q;
+    return -(140.0 / (Pi * hw * hw * hw)) * q * t * t * t;
+}
+
+inline bool TwoScaleKernelActive()
+{
+    return run_options.interface_kernel == "two_scale";
+}
+
+/** W of the ACTIVE Scheme E kernel (legacy by default). */
+inline Real SchemeKernelW(Real r)
+{
+    if (!TwoScaleKernelActive())
+        return RhoKernelW(r);
+    const Real h = RhoSmoothingH();
+    const Real xi = run_options.interface_xi * Sigma();
+    const Real beta = run_options.interface_beta;
+    const Real ch = 144.0 / (5.0 * h * h);
+    const Real cxi = 144.0 / (5.0 * xi * xi);
+    return (ch * TwoScaleKernelWRaw(r, h) - beta * cxi * TwoScaleKernelWRaw(r, xi)) /
+           (1.0 - beta);
+}
+
+/** dW/dr of the ACTIVE Scheme E kernel (legacy by default). */
+inline Real SchemeKernelDW(Real r)
+{
+    if (!TwoScaleKernelActive())
+        return RhoKernelDW(r);
+    const Real h = RhoSmoothingH();
+    const Real xi = run_options.interface_xi * Sigma();
+    const Real beta = run_options.interface_beta;
+    const Real ch = 144.0 / (5.0 * h * h);
+    const Real cxi = 144.0 / (5.0 * xi * xi);
+    return (ch * TwoScaleKernelDWRaw(r, h) -
+            beta * cxi * TwoScaleKernelDWRaw(r, xi)) / (1.0 - beta);
+}
+
+/** Pair-loop cutoff for the ACTIVE Scheme E kernel (legacy: h_rho). */
+inline Real SchemeKernelSupport()
+{
+    if (!TwoScaleKernelActive())
+        return RhoSmoothingH();
+    return std::max(RhoSmoothingH(), run_options.interface_xi * Sigma());
+}
+
+
 /** Sweep 1: local density and its gradient.  True zero path at lambda = 0. */
 class CGSquareGradientDensity : public LocalDynamics, public DataDelegateInner
 {
@@ -1644,6 +1754,8 @@ class CGSquareGradientDensity : public LocalDynamics, public DataDelegateInner
             const Real r = neighborhood.r_ij_[n];
             if (r <= TinyReal)
                 continue;
+            // density estimator: ALWAYS the legacy kernel (rho_i = Sum W_h);
+            // only the energy kernel is allowed to differ (two-scale).
             const Real w = RhoKernelW(r);
             if (w <= 0.0)          // outside the kernel support
                 continue;
@@ -1932,7 +2044,7 @@ class CGSquareGradientConjugate : public LocalDynamics, public DataDelegateInner
             const Real r = neighborhood.r_ij_[n];
             if (r <= TinyReal)
                 continue;
-            const Real w = RhoKernelW(r);
+            const Real w = SchemeKernelW(r);
             if (w <= 0.0)
                 continue;
             const Real Jij = SGDifferenceJ(ri, pos_[index_j][1]);
@@ -1985,8 +2097,12 @@ class CGSquareGradientDifferenceForce : public LocalDynamics,
             const Real r = neighborhood.r_ij_[n];
             if (r <= TinyReal)
                 continue;
-            const Real w = RhoKernelW(r);
-            const Real dw = RhoKernelDW(r);
+            // w / dw_k : the ENERGY kernel (may be two-scale);
+            // dw_rho   : the DENSITY-estimator derivative (always legacy).
+            const Real w = SchemeKernelW(r);
+            const Real dw_k = SchemeKernelDW(r);
+            const Real dw_rho = RhoKernelDW(r);
+            const Real dw = dw_rho;
             if (w <= 0.0 && dw == 0.0)
                 continue;
             const Vecd e = neighborhood.e_ij_[n];
@@ -1996,7 +2112,7 @@ class CGSquareGradientDifferenceForce : public LocalDynamics,
             // (2) explicit d(measure)/dx and dW/dx branches, gated by (d rho)^2
             const Real drho = rho_i - rho_[index_j];
             f -= (drho * drho) * pref *
-                 (SGDifferenceDJdr() * w * radial_hat + Jij * dw * e);
+                 (SGDifferenceDJdr() * w * radial_hat + Jij * dw_k * e);
             ++nterm;
         }
         if (count_terms != nullptr)
@@ -2052,14 +2168,15 @@ class CGSquareGradientDifferenceForce : public LocalDynamics,
                     if (r <= TinyReal)
                         continue;
                     const Vecd e = nb.e_ij_[n];
-                    const Real w = RhoKernelW(r), dw = RhoKernelDW(r);
+                    const Real w = SchemeKernelW(r), dw_k = SchemeKernelDW(r);
+                    const Real dw = RhoKernelDW(r);   // density chain rule
                     if (w <= 0.0 && dw == 0.0)
                         continue;
                     const Real Jij = SGDifferenceJ(ri, pos_[j][1]);
                     fc -= conj_[j] * dw * e;
                     const Real drho = rho_i - rho_[j];
                     fe -= (drho * drho) * pref *
-                          (SGDifferenceDJdr() * w * Vecd(0.0, 1.0) + Jij * dw * e);
+                          (SGDifferenceDJdr() * w * Vecd(0.0, 1.0) + Jij * dw_k * e);
                 }
             }
             const Vecd ft = fc + fe;
@@ -2551,12 +2668,12 @@ void SGConfigForce(const std::vector<Vecd> &p, int mode, bool include_geom,
 //=============================================================================
 //  M1.3R: independent from-scratch reconstruction of Scheme E (diagnostic only)
 //=============================================================================
-inline Real SGDifferenceW(const Real r) { return RhoKernelW(r); }
+inline Real SGDifferenceW(const Real r) { return SchemeKernelW(r); }
 
 /** From-scratch Scheme E energy (brute force over all pairs, z minimum image). */
 Real SGDifferenceConfigEnergy(const std::vector<Vecd> &p)
 {
-    const Real h = RhoSmoothingH();
+    const Real h = SchemeKernelSupport();
     const Real lz = DomainLength();
     const Real r0 = AxisRadius();
     const size_t n = p.size();
@@ -2595,7 +2712,7 @@ Real SGDifferenceConfigEnergy(const std::vector<Vecd> &p)
 void SGDifferenceConfigForce(const std::vector<Vecd> &p, bool include_explicit,
                              std::vector<Vecd> &F)
 {
-    const Real h = RhoSmoothingH();
+    const Real h = SchemeKernelSupport();
     const Real lz = DomainLength();
     const Real r0 = AxisRadius();
     const size_t n = p.size();
@@ -2650,7 +2767,7 @@ void SGDifferenceConfigForce(const std::vector<Vecd> &p, bool include_explicit,
                 const Real Jij = SGDifferenceJ(p[i][1], p[j][1]);
                 F[i] -= drho * drho * pref *
                         (SGDifferenceDJdr() * SGDifferenceW(r) * Vecd(0.0, 1.0) +
-                         Jij * RhoKernelDW(r) * e);
+                         Jij * SchemeKernelDW(r) * e);
             }
         }
     }
