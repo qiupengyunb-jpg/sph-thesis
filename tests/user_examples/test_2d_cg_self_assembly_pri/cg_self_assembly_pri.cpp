@@ -2045,7 +2045,7 @@ class CGSquareGradientConjugate : public LocalDynamics, public DataDelegateInner
             if (r <= TinyReal)
                 continue;
             const Real w = SchemeKernelW(r);
-            if (w <= 0.0)
+            if (r >= SchemeKernelSupport())   // support gate (keeps negative lobes)
                 continue;
             const Real Jij = SGDifferenceJ(ri, pos_[index_j][1]);
             s += 2.0 * pref * Jij * w * (rho_[index_i] - rho_[index_j]);
@@ -2103,7 +2103,7 @@ class CGSquareGradientDifferenceForce : public LocalDynamics,
             const Real dw_k = SchemeKernelDW(r);
             const Real dw_rho = RhoKernelDW(r);
             const Real dw = dw_rho;
-            if (w <= 0.0 && dw == 0.0)
+            if (r >= SchemeKernelSupport())   // support gate (keeps negative lobes)
                 continue;
             const Vecd e = neighborhood.e_ij_[n];
             const Real Jij = SGDifferenceJ(ri, pos_[index_j][1]);
@@ -2170,7 +2170,7 @@ class CGSquareGradientDifferenceForce : public LocalDynamics,
                     const Vecd e = nb.e_ij_[n];
                     const Real w = SchemeKernelW(r), dw_k = SchemeKernelDW(r);
                     const Real dw = RhoKernelDW(r);   // density chain rule
-                    if (w <= 0.0 && dw == 0.0)
+                    if (r >= SchemeKernelSupport())   // support gate (keeps negative lobes)
                         continue;
                     const Real Jij = SGDifferenceJ(ri, pos_[j][1]);
                     fc -= conj_[j] * dw * e;
