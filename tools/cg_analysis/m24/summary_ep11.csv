@@ -1,0 +1,2 @@
+label,n_particles,n_frames,t_end,D_z,D_r,D_z_over_free,D_r_over_free,D_ratio_rz,tau_50_exchange,X_end,cluster_splits,n_cluster_ge3_end,largest_cluster_end,state
+ofat_ep11,201,201,200.0,0.0597159326155202,0.03598567044789321,0.0597159326155202,0.03598567044789321,0.6026142249102298,170.0025,0.5078453884424033,0,1,195,B viscous liquid
