@@ -1,0 +1,2 @@
+label,n_particles,n_frames,t_end,D_z,D_r,D_z_over_free,D_r_over_free,D_ratio_rz,tau_50_exchange,X_end,cluster_splits,n_cluster_ge3_end,largest_cluster_end,state
+prod_P5,266,1001,1000.005,0.0320094929781853,0.0055352410781857415,0.0320094929781853,0.0055352410781857415,0.17292498453374594,575.0024999999999,0.6252072968490879,0,1,262,B viscous liquid
