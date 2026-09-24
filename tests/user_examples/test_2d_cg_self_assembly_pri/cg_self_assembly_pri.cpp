@@ -2674,6 +2674,7 @@ inline Real SGDifferenceW(const Real r) { return SchemeKernelW(r); }
 Real SGDifferenceConfigEnergy(const std::vector<Vecd> &p)
 {
     const Real h = SchemeKernelSupport();
+    const Real h_rho = RhoSmoothingH();
     const Real lz = DomainLength();
     const Real r0 = AxisRadius();
     const size_t n = p.size();
@@ -2713,6 +2714,7 @@ void SGDifferenceConfigForce(const std::vector<Vecd> &p, bool include_explicit,
                              std::vector<Vecd> &F)
 {
     const Real h = SchemeKernelSupport();
+    const Real h_rho = RhoSmoothingH();
     const Real lz = DomainLength();
     const Real r0 = AxisRadius();
     const size_t n = p.size();

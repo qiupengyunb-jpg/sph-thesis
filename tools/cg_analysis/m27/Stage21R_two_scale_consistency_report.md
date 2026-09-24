@@ -96,3 +96,59 @@ finished: steps=6667 wall_seconds=3.0360
 | solver 改动 | `cg_self_assembly_pri.cpp`（3 处支集门控）|
 | 回归 / FD / 小算例数据 | `E:\哈哈\_stage21r\{reg,fd_ts,fd_leg,small}` |
 | 本轮未做 | 未改物理公式 / λ / V0 / β 默认值 / legacy 核；未跑生产算例 |
+
+---
+
+# 追加：Phase 4 深入排查（第二轮，2026-09-24）
+
+## 4.3 已修的两处（均保留，zero-path 复验仍逐位一致）
+
+1. **归一化重复计入**：`SGDifferencePairPref()` 已含 `c_h=144/(5h²)`，原两尺度核又乘一次 c ⇒ 改为
+   `SchemeKernelW/DW = [W_h − β(h²/ξ²)W_ξ]/(1−β)`（等效 λ 不再被放大 3.67 倍）。
+   **FD 结果完全不变**（1.074e+01 → 1.074e+01）⇒ 该因子两侧共有，**不是 FD 失配的原因**，但是必须保留的标定修正。
+2. **from-scratch 密度回路**：`SGDifferenceConfigEnergy/Force` 的 ρ 重建原本调用 `SGDifferenceW`（两尺度核）⇒ 改为
+   `rho[i] += RhoKernelW(r)`（legacy、支集 h_ρ），**能量核**只在配对能量/显式支使用（支集 `SchemeKernelSupport()`）。
+
+## 4.4 仍然失败，但误差特征完全一致（δ 无关，仅径向）
+
+| δ | Fr max rel err | Fz max rel err |
+|---|---|---|
+| 1e-4 / 3e-5 / 1e-5 / 3e-6 | **1.074e+01（四档相同）** | **0.000e+00** |
+
+legacy 同配置：2.87e-08（δ=1e-4）→ 9.59e-09（δ=3e-6）✅
+
+## 4.5 决定性新证据：**参考实现与 solver 的 ρ 本身就不一致**
+
+`--sg-fd-check` 顶部诊断（two_scale, h=5）：
+
+```
+solver vs independent reference (max rel): rho=0.31246   grad rho=0.490075   force=5.7874
+max |rho|: reference=0.526621   solver=0.526621
+worst grad mismatch at i=149  pos=(58.8, 7.57812)   reference neighbours within h_rho=18
+   rho:  reference=0.526621   solver=0.44332
+   grad: reference=(-1.2e-15,-2.4e-17)   solver=(-0.16742, 2.8e-17)
+```
+
+* **同一个粒子**：参考 ρ=0.5266（18 个 h_ρ 内邻居）对 solver ρ=0.4433 ⇒ **相差 31%**；
+* 参考梯度 ≈0（该粒子在参考中处于近均匀位置）而 solver 梯度 = −0.167；
+* **该不一致在 legacy 下不存在**（legacy FD 通过）。
+
+⇒ **结论：FD 失配的当前根因不在"配对过滤"（那已修好），而在"参考实现与 solver 的密度场 ρ 不是同一个对象"。**
+solver 的 ρ 偏小 ⇒ solver 侧**少算了邻居**（或邻居表在该配置下未包含全部 h_ρ 内配对）。这是下一轮要查的第一项：
+核对 FD 检查时 solver 的邻居表是否在**同一时刻、同一位置**刷新（以及 `--sg-fd-check` 路径是否在 rho/grad sweep 之后才构建参考）。
+
+## 4.6 Phase 5 小算例（本轮重跑，gate 仍未过 ⇒ 不做物理解读）
+
+```
+R0=3 h=3 Lz=80 xi=2.9 beta=0.3 t=50 : N=201 T_kin=1.0177 guard=0 hard=0 无 NaN, finished steps=6667
+```
+
+## 4.7 本轮停止状态
+
+| 条件 | 状态 |
+|---|---|
+| gate audit | ✅ |
+| pair selection 修复（支集门控） | ✅（1/δ 特征消失） |
+| legacy zero-path | ✅ 逐位一致 |
+| force–energy consistency | ❌（残余径向常数失配 10.74；新证据指向 ρ 场不一致） |
+| small smoke | ✅ 稳定 |
