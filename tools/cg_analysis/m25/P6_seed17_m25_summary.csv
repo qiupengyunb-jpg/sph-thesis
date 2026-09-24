@@ -1,0 +1,2 @@
+label,n_frames,t_end,frac_two_bead,n_two_frames,d_median,d_min,d_max,d_preferred,frac_approaching,frac_holding,n_fusion_events,m_ratio_median
+P6_seed17,1001,1000.005,0.3276723276723277,328,28.0,11.0,80.0,27.5,0.4892966360856269,0.1559633027522936,7,1.4473018950402803
